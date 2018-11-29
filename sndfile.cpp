@@ -338,50 +338,33 @@ void SndSource::init(const String& file, bool autorepeat)
 	return;
     }
 
-    // Yate is really dumb, and only understands a few format... barely.
-    // We only try and read raw data for that which it understands
-    // otherwise for everthing else we read as 8000Hz-mono-s16-pcm
+    m_format = "";
+    if (m_info.channels != 1)
+	m_format << m_info.channels << "*";
 
     switch (m_info.format & SF_FORMAT_SUBMASK) {
 	case SF_FORMAT_ULAW:
-	    m_format = "mulaw";
+	    m_format << "mulaw";
 	    m_sndfile_raw = true;
 	    m_brate = 1;
 	    break;
 	case SF_FORMAT_ALAW:
-	    m_format = "alaw";
+	    m_format << "alaw";
 	    m_sndfile_raw = true;
 	    m_brate = 1;
 	    break;
 
-	/*
-	 * For everything else, lie and let libsndfile convert it for us to
-	 * signed 16-bit pcm.
-	 */
 	default:
 	    m_sndfile_raw = false;
-	    m_format = "slin";
+	    m_format << "slin";
 	    m_brate = 2;
 	    break;
     }
     if (m_info.samplerate != 8000)
 	m_format << "/" << m_info.samplerate;
-
-    switch (m_info.channels) {
-	case 1:
-	    break;
-	case 2:
-	    m_format << "/2"; break;
-	default:
-	    Debug(DebugWarn,"Probably unsupported number of channels: %d",m_info.channels);
-	    m_format << "/" << m_info.channels;
-	    break;
-    }
-
-
     m_brate *= (m_info.samplerate * m_info.channels);
 
-    DDebug(&__plugin,DebugAll, "\n"
+    XDebug(&__plugin,DebugAll, "\n"
 "========== Info ============\n"
 "     Frames: %12ld\n"
 " SampleRate: %12d Hz\n"
@@ -420,13 +403,13 @@ SndSource::~SndSource()
 	    Debug(&__plugin,DebugInfo,"SndSource rate=" FMT64U " b/s",m_time);
 	}
     }
-    if (m_stream) {
-	delete m_stream;
-	m_stream = 0;
-    }
     if (m_sndfile) {
 	sf_close(m_sndfile);
 	m_sndfile = 0;
+    }
+    if (m_stream) {
+	delete m_stream;
+	m_stream = 0;
     }
     s_mutex.lock();
     s_reading--;
@@ -827,7 +810,7 @@ unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, 
 		disc->init();
 	    }
 	}
-	return invalidStamp();
+	return nsamp == data.length() ? invalidStamp() : nsamp;
     }
     return 0;
 }
@@ -1306,7 +1289,11 @@ void SndFileDriver::statusParams(String& str)
 SndFileDriver::SndFileDriver()
     : Driver("snd","misc"), m_attachHandler(0), m_recHandler(0)
 {
-    Output("Loaded module SndFile");
+    char buffer[128];
+
+    sf_command(NULL, SFC_GET_LIB_VERSION, buffer, sizeof(buffer));
+
+    Output("Loaded module SndFile - Based on %s", buffer);
 }
 
 void SndFileDriver::initialize()
