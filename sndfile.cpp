@@ -84,6 +84,7 @@ public:
     ~SndSource();
     virtual void run();
     virtual void cleanup();
+    virtual bool setFormat(const DataFormat &format);
     virtual void attached(bool added);
     virtual bool control(NamedList& param);
     void setNotify(const String& id);
@@ -129,7 +130,6 @@ public:
     inline void setNotify(const String& id)
 	{ m_id = id; }
 private:
-    static bool parseFormat(const char *str, SF_INFO &info);
     CallEndpoint* m_chan;
     Stream* m_stream;
 
@@ -199,6 +199,31 @@ INIT_PLUGIN(SndFileDriver);
 UNLOAD_PLUGIN(unloadNow)
 {
     return __plugin.unload(unloadNow);
+}
+
+static bool parseFormat(const char *str, SF_INFO &info)
+{
+    String fmt(str);
+
+    if (!fmt.matches(s_formatParser)) {
+	Debug(&__plugin,DebugWarn,"Cannot parse \"%s\"", str);
+	return false;
+    }
+
+    info.samplerate = 8000;
+    info.channels = 1;
+
+    fmt.matchString(1) >> info.channels;
+    String encoding(fmt.matchString(2));
+    fmt.matchString(3) >> "/" >> info.samplerate;
+
+    info.format |= lookup(encoding, sf_subtypes, 0);
+
+    DDebug(&__plugin,DebugAll,"%s %s %s --> %d %x %d \n",
+	fmt.matchString(1).c_str(),fmt.matchString(2).c_str(),fmt.matchString(3).c_str(),
+	info.channels, info.format, info.samplerate);
+
+    return (info.format & SF_FORMAT_SUBMASK) != 0;
 }
 
 class AttachHandler : public MessageHandler
@@ -412,7 +437,7 @@ void SndSource::init(const String& file, bool autorepeat)
 
     if (!m_sndfile) {
 	Debug(&__plugin,DebugWarn,"Opening '%s' for reading: %s",file.c_str(),sf_strerror(NULL));
-	notify(this,"error");
+	notify(this, "error");
 	return;
     }
 
@@ -420,8 +445,13 @@ void SndSource::init(const String& file, bool autorepeat)
     const FormatInfo *fi = NULL;
     const char *yate_format_name = lookup(m_info.format & SF_FORMAT_SUBMASK, sf_subtypes);
 
-    // Look up if Yate handles this internally. The allows us to possibly avoid
-    // unnecisarry conversions. Re: g726 file -> slin -> g726 call is dumb.
+    /*
+     * Initially set our offered format as the raw on-disk form if possible. If
+     * the consumers cannot accept it untranslated, ::setFormat() will be called
+     * and we will switch back to reading as slin only. This allows use to avoid
+     * unnecisarry conversions like mulaw -> slin -> mulaw, but doesn't break
+     * things like mulaw/16000 -> slin/16000 -> slin -> mulaw.
+     */
     if (yate_format_name) {
         if (m_info.channels != 1)
 	    native_format << m_info.channels << "*";
@@ -431,6 +461,7 @@ void SndSource::init(const String& file, bool autorepeat)
 	fi = FormatRepository::getFormat(native_format);
     }
 
+    /* Only offer on-disk formats for fixed bit rate formats. */
     if (fi && fi->dataRate() != 0) {
 	m_format = native_format;
 	m_sndfile_raw = true;
@@ -445,6 +476,8 @@ void SndSource::init(const String& file, bool autorepeat)
 	m_sndfile_raw = false;
 	m_brate = 2 * m_info.channels * m_info.samplerate;
     }
+
+    Debug(&__plugin,DebugInfo,"Playing '%s' as %s", file.c_str(), m_format.c_str());
 
     XDebug(&__plugin,DebugAll, "\n"
 "========== Info ============\n"
@@ -464,6 +497,33 @@ void SndSource::init(const String& file, bool autorepeat)
 	    Debug(&__plugin,DebugWarn,"Cannot autorepeat a non-seekable file/stream");
     }
     start("Snd Source");
+}
+
+bool SndSource::setFormat(const DataFormat &format)
+{
+    DDebug(&__plugin,DebugAll,"SndSource::setFormat \"%s\"",format.c_str());
+
+    return false;
+
+    /*
+     * If we are here, the on-disk format cannot be used. As the only options
+     * are the on-disk formats, or slin of the same channel/samplerate, and
+     * translation only really works on slin, switch back to slin.
+    if (m_sndfile_raw) {
+	m_sndfile_raw = false;
+	m_format = "";
+	if (m_info.channels != 1)
+	    m_format << m_info.channels << "*";
+	m_format << "slin";
+	if (m_info.samplerate != 8000)
+	    m_format << "/" << m_info.samplerate;
+	m_brate = 2 * m_info.channels * m_info.samplerate;
+
+	return m_format == format;
+    }
+     */
+
+    return false;
 }
 
 SndSource::SndSource(CallEndpoint* chan, unsigned maxlen, bool autoclose)
@@ -537,8 +597,10 @@ void SndSource::run()
 
     while (looping(noChan)) {
 
-	if (m_maxlen && m_total >= m_maxlen)
-	    break;
+	if (m_maxlen && m_total >= m_maxlen) {
+	    /* simulate EOF */
+	    goto do_eof;
+	}
 
 	if (m_nodata) {
 	    flags |= DataNode::DataSilent;
@@ -645,6 +707,7 @@ void SndSource::run()
     if (r) {
 	notify(0, "replaced");
     } else {
+do_eof:
 	Debug(&__plugin,DebugAll,"SndSource '%s' end of data (%u played) chan=%p [%p]",
 	    m_id.c_str(),m_total,m_chan,this);
 	Forward(m_buffer, ts, (unsigned long)DataNode::DataEnd);
@@ -687,7 +750,7 @@ void SndSource::setNotify(const String& id)
 {
     m_id = id;
     if (!(m_stream || m_sndfile || m_nodata))
-	notify(this);
+	notify(this, "null");
 }
 
 void SndSource::notify(SndSource* source, const char* reason)
@@ -983,31 +1046,6 @@ void SndConsumer::attached(bool added)
 	DDebug(&__plugin,DebugInfo,"SndConsumer clearing dead chan %p [%p]",m_chan,this);
 	m_chan = 0;
     }
-}
-
-bool SndConsumer::parseFormat(const char *str, SF_INFO &info)
-{
-    String fmt(str);
-
-    if (!fmt.matches(s_formatParser)) {
-	Debug(&__plugin,DebugWarn,"Cannot parse \"%s\"", str);
-	return false;
-    }
-
-    info.samplerate = 8000;
-    info.channels = 1;
-
-    fmt.matchString(1) >> info.channels;
-    String encoding(fmt.matchString(2));
-    fmt.matchString(3) >> "/" >> info.samplerate;
-
-    info.format |= lookup(encoding, sf_subtypes, 0);
-
-    DDebug(&__plugin,DebugAll,"%s %s %s --> %d %x %d \n",
-	fmt.matchString(1).c_str(),fmt.matchString(2).c_str(),fmt.matchString(3).c_str(),
-	info.channels, info.format, info.samplerate);
-
-    return (info.format & SF_FORMAT_SUBMASK) != 0;
 }
 
 Disconnector::Disconnector(CallEndpoint* chan, const String& id, SndSource* source, SndConsumer* consumer, bool disc, const char* reason)
