@@ -2,7 +2,9 @@
  * sndfile.cpp
  * This file is based on work from the YATE Project http://YATE.null.ro
  *
- * Snd file driver (record+playback)
+ * libsndfile based file playback and record.
+ *
+ * Arthur Taylor <art@ified.ca>
  *
  * Yet Another Telephony Engine - a fully featured software PBX and IVR
  * Copyright (C) 2004-2014 Null Team
@@ -22,28 +24,6 @@
 #include <yatephone.h>
 #include <sndfile.h>
 #include <string.h>
-
-
-/*
- * A word about data formats. There are two data formats that we care about
- * when playing or recording from a file. They are the on-disk format that
- * libsndfile reads/writes in and the format of the DataEndpoints use to send
- * data around in Yate.
- *
- * libsndfile's API allows for data to be read/written as PCM shorts, ints,
- * floats or doubles, and it bothers with whatever conversion or encoding is
- * necessary for the on-disk format. Thus, most of the time it makes sense just
- * to set the DataEndpoints to "slin".
- *
- * However, libsndfile also contains a raw read/write functionality, and there
- * are a few situations when an unnecessary conversion can be avoided by
- * exposing the on-disk format into Yate and using raw reads/writes. For
- * example, consider a call with mulaw audio. When playing a file to such a
- * call, if the file is also mulaw, it makes little sense to go
- * mulaw->slin->mulaw, so be reading the data raw and presenting it to yate as
- * mulaw we can avoid the unnecessary conversion. These are special cases
- * though.
- */
 
 using namespace TelEngine;
 namespace { // anonymous
@@ -79,7 +59,7 @@ class SndSource : public ThreadedSource
 public:
     static SndSource* create(const String& file, CallEndpoint* chan, unsigned maxlen,
 	bool autoclose, bool autorepeat, const NamedString* param);
-    ~SndSource();
+    virtual ~SndSource();
     virtual void run();
     virtual void cleanup();
     virtual void attached(bool added);
@@ -90,27 +70,19 @@ private:
     void init(const String& file, bool autorepeat);
     void notify(SndSource* source, const char* reason = 0);
 
-    CallEndpoint* m_chan;
-    Stream* m_stream;
-    ObjList* m_assets;
-    DataBlock m_buffer;
-    ObjList* m_commands;
-
-    unsigned m_brate;
-    int64_t m_repeatPos;
-    unsigned m_total;
-    unsigned m_maxlen;
-    uint64_t m_time;
-
-    String m_id;
-
-    bool m_autoclose;
-    bool m_nodata;
-
-    // libsndfile members
     SNDFILE* m_sndfile;
     SF_INFO m_info;
-    bool m_sndfile_raw;
+    CallEndpoint* m_chan;
+    Stream* m_stream;
+    DataBlock m_buffer;
+    String m_id;
+    int64_t m_repeatPos;
+    uint64_t m_time;
+    unsigned m_brate;
+    unsigned m_total;
+    unsigned m_maxlen;
+    bool m_autoclose : 1;
+    bool m_nodata : 1;
 };
 
 class SndConsumer : public DataConsumer
@@ -118,7 +90,7 @@ class SndConsumer : public DataConsumer
 public:
     SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen,
 	const char* format, bool append, const NamedString* param);
-    ~SndConsumer();
+    virtual ~SndConsumer();
     virtual bool setFormat(const DataFormat& format);
     virtual unsigned long Consume(const DataBlock& data, unsigned long tStamp, unsigned long flags);
     virtual void attached(bool added);
@@ -127,18 +99,17 @@ public:
     inline void setNotify(const String& id)
 	{ m_id = id; }
 private:
+    SNDFILE* m_sndfile;
+    SF_INFO m_info;
     CallEndpoint* m_chan;
     Stream* m_stream;
-    unsigned m_total;
-    unsigned m_maxlen;
-    uint64_t m_time;
     String m_id;
     String m_reason;
     String m_filename;
-    SNDFILE* m_sndfile;
-    SF_INFO m_info;
+    uint64_t m_time;
+    unsigned m_total;
+    unsigned m_maxlen;
     bool m_sf_format_set : 1;
-    bool m_sf_raw : 1;
     bool m_valid : 1;
 };
 
@@ -173,9 +144,10 @@ class SndFileDriver : public Driver
 {
 public:
     SndFileDriver();
+    virtual ~SndFileDriver();
     virtual void initialize();
     virtual bool msgExecute(Message& msg, String& dest);
-    bool unload(bool unloadNow);
+    bool tryUnload();
 protected:
     void statusParams(String& str);
 private:
@@ -193,7 +165,9 @@ INIT_PLUGIN(SndFileDriver);
 
 UNLOAD_PLUGIN(unloadNow)
 {
-    return __plugin.unload(unloadNow);
+    if (unloadNow)
+	return __plugin.tryUnload();
+    return true;
 }
 
 static bool parseFormat(const char *str, SF_INFO &info)
@@ -380,14 +354,8 @@ void SndSource::init(const String& file, bool autorepeat)
 	    return;
 	}
 
-	/* Need a parser */
-
-	m_assets = file.split(',',false);
-
-	String &tmp_file(*static_cast<String*>(m_assets->get()));
-
 	memset(&m_info, 0, sizeof(m_info));
-	m_sndfile = sf_open(tmp_file.c_str(), SFM_READ, &m_info);
+	m_sndfile = sf_open(file.c_str(), SFM_READ, &m_info);
 
 	/* If the file type couldn't be detected, try and guess based on it's
 	** extension.
@@ -395,9 +363,9 @@ void SndSource::init(const String& file, bool autorepeat)
 	if (!m_sndfile) {
 	    const char *s;
 
-	    s = strrchr(tmp_file.c_str(), '/');
+	    s = strrchr(file.c_str(), '/');
 	    if (!s)
-		s = strrchr(tmp_file.c_str(), '.');
+		s = strrchr(file.c_str(), '.');
 	    else
 		s = strrchr(s, '.');
 	    if (s)
@@ -424,9 +392,9 @@ void SndSource::init(const String& file, bool autorepeat)
 	    }
 
 	    Debug(&__plugin,DebugMild,"Couldn't detect format of '%s', assuming raw %s.",
-		tmp_file.c_str(), sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK));
+		file.c_str(), sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK));
 
-	    m_sndfile = sf_open(tmp_file.c_str(), SFM_READ, &m_info);
+	    m_sndfile = sf_open(file.c_str(), SFM_READ, &m_info);
 	}
     }
 
@@ -436,34 +404,14 @@ void SndSource::init(const String& file, bool autorepeat)
 	return;
     }
 
-    /*
-     * Note that we don't offer slin as a raw-i/o format, because of
-     * endianess. Also, any stateful formats.
-     */
     String tmp_format;
     if (m_info.channels != 1)
 	tmp_format << m_info.channels << "*";
-    switch (m_info.format & SF_FORMAT_SUBMASK) {
-	case SF_FORMAT_ULAW: tmp_format << "mulaw"; m_sndfile_raw = true; break;
-	case SF_FORMAT_ALAW: tmp_format << "alaw"; m_sndfile_raw = true; break;
-	default: tmp_format << "slin"; m_sndfile_raw = false; break;
-    }
+    tmp_format << "slin";
     if (m_info.samplerate != 8000)
 	tmp_format << "/" << m_info.samplerate;
 
-    if (m_sndfile_raw) {
-	const FormatInfo *fi;
-	fi = FormatRepository::getFormat(tmp_format);
-	if (fi && fi->dataRate() != 0) {
-	    m_brate = fi->dataRate();
-	} else {
-	    m_sndfile_raw = false;
-	    tmp_format = sf_info_to_format(m_info);
-	}
-    }
-    if (!m_sndfile_raw) {
-	m_brate = 2 * m_info.channels * m_info.samplerate;
-    }
+    m_brate = 2 * m_info.channels * m_info.samplerate;
     m_format = tmp_format;
     Debug(&__plugin,DebugInfo,"Playing '%s' as %s", file.c_str(), m_format.c_str());
 
@@ -489,9 +437,9 @@ void SndSource::init(const String& file, bool autorepeat)
 
 
 SndSource::SndSource(CallEndpoint* chan, unsigned maxlen, bool autoclose)
-    : m_chan(chan), m_stream(0), m_assets(0), m_brate(0), m_repeatPos(-1),
-      m_total(0), m_maxlen(maxlen), m_time(0), m_autoclose(autoclose),
-      m_nodata(false), m_sndfile(0), m_sndfile_raw(false)
+    :m_sndfile(0), m_chan(chan), m_stream(0),
+     m_repeatPos(-1), m_time(0), m_brate(0), m_total(0), m_maxlen(maxlen),
+     m_autoclose(autoclose), m_nodata(false)
 {
     Debug(&__plugin,DebugAll,"SndSource::SndSource(%p) [%p]",chan,this);
     memset(&m_info, 0, sizeof(SF_INFO));
@@ -520,29 +468,29 @@ SndSource::~SndSource()
 	delete m_stream;
 	m_stream = 0;
     }
-    if (m_assets) {
-	delete m_assets;
-	m_assets = 0;
-    }
     s_mutex.lock();
     s_reading--;
     s_mutex.unlock();
 }
 
-void SndSource::run()
-{
+void SndSource::run() {
     unsigned long ts = 0;
-    sf_count_t r = 0;
+    sf_count_t nbytes = 0;
     // internally reference if used for override or replace purpose
     bool noChan = (0 == m_chan);
+    unsigned int blocklen = (m_brate*20)/1000; // 20ms
+    uint64_t tpos = 0;
+    uint64_t last_repeat = 0;
+    unsigned long flags = 0;
 
     // wait until at least one consumer is attached
     for (;;) {
 	lock();
-	r = m_consumers.count();
-	unlock();
-	if (r)
+	if (m_consumers.count()) {
+	    unlock();
 	    break;
+	}
+	unlock();
 	if (!looping(noChan)) {
 	    notify(0,"replaced");
 	    return;
@@ -551,12 +499,8 @@ void SndSource::run()
     }
     DDebug(&__plugin,DebugAll,"Consumer found, starting to play data with rate %d [%p]",m_brate,this);
 
-    unsigned int blen = (m_brate*20)/1000;
-    m_buffer.assign(0,blen);
-    uint64_t tpos = 0;
-    uint64_t last_repeate = 0;
+    m_buffer.assign(0,blocklen);
     m_time = tpos;
-    unsigned long flags = 0;
 
     while (looping(noChan)) {
 
@@ -568,12 +512,9 @@ void SndSource::run()
 
 	if (m_nodata) {
 	    flags |= DataNode::DataSilent;
-	    r = m_buffer.length();
+	    nbytes = m_buffer.length();
 	} else {
-	    if (m_sndfile_raw)
-		r = sf_read_raw(m_sndfile, m_buffer.data(), m_buffer.length());
-	    else
-		r = sf_read_short(m_sndfile, (short *)m_buffer.data(), m_buffer.length()/2)*2;
+	    nbytes = sf_read_short(m_sndfile, (int16_t *)m_buffer.data(), m_buffer.length() / 2) * 2;
 	}
 
 	// start counting time _after_ the first successful read
@@ -583,9 +524,9 @@ void SndSource::run()
 	}
 
 	// Check for EOF. This is the only case that libsndfile returns 0.
-	if (!r) {
+	if (!nbytes) {
 	    if (m_repeatPos >= 0) {
-		if (m_total == last_repeate) {
+		if (m_total == last_repeat) {
 		    Debug(&__plugin,DebugWarn,"Asked to autorepeat over no data! Exiting.");
 		    break;
 		}
@@ -597,58 +538,24 @@ void SndSource::run()
 
 		DDebug(&__plugin,DebugAll,"Autorepeating from offset " FMT64 " [%p]", m_repeatPos, this);
 
-		last_repeate = m_total;
-		m_buffer.assign(0,blen);
+		last_repeat = m_total;
+		m_buffer.assign(0,blocklen);
 		flags |= DataNode::DataMark;
 		continue;
 	    }
-
-	    /* If a prompt, try and load the next file. */
-	    if (m_assets) {
-		for (m_assets->remove(); m_assets->length(); m_assets->remove()) {
-		    String* next_file(static_cast<String *>(m_assets->get()));
-		    SF_INFO new_info;
-
-		    if (m_sndfile) {
-			sf_close(m_sndfile);
-			m_sndfile = NULL;
-		    }
-
-		    if (!next_file)
-			break;
-
-		    m_sndfile = sf_open(next_file->c_str(), SFM_READ, &new_info);
-		    if (m_sndfile) {
-			if (new_info.samplerate == m_info.samplerate &&
-			    new_info.channels == m_info.channels &&
-			    new_info.format == m_info.format) {
-			    memcpy(&m_info, &new_info, sizeof(SF_INFO));
-			    Debug(&__plugin,DebugAll,"SndSource '%s' playing next file \"%s\"", m_id.c_str(),next_file->c_str());
-			    break;
-			} else {
-			    Debug(&__plugin,DebugWarn,"SndSource '%s' cannot string files of difference formats!", m_id.c_str());
-			}
-		    } else {
-			Debug(&__plugin,DebugWarn,"Opening '%s' for reading: %s",next_file->c_str(),sf_strerror(NULL));
-		    }
-		}
-		if (m_sndfile)
-		    continue;
-		else
-		    break;
-	    }
+	    break;
 	}
 
-	if (r < (int)m_buffer.length()) {
+	if (nbytes < (int)m_buffer.length()) {
 	    // if desired and possible extend last byte to fill buffer
 	    if (s_dataPadding && ((m_format == "mulaw") || (m_format == "alaw"))) {
 		unsigned char* d = (unsigned char*)m_buffer.data();
-		unsigned char last = d[r-1];
-		while (r < (int)m_buffer.length())
-		    d[r++] = last;
+		unsigned char last = d[nbytes-1];
+		while (nbytes < (int)m_buffer.length())
+		    d[nbytes++] = last;
 	    }
 	    else
-		m_buffer.assign(m_buffer.data(),r);
+		m_buffer.assign(m_buffer.data(),nbytes);
 	}
 
 	int64_t dly = tpos - Time::now();
@@ -662,13 +569,13 @@ void SndSource::run()
 
 	// Account for sent data.
 	ts += m_buffer.length()*m_info.samplerate/m_brate;
-	m_total += r;
-	tpos += (r*(uint64_t)1000000/m_brate);
+	m_total += nbytes;
+	tpos += (nbytes*(uint64_t)1000000/m_brate);
 	flags = 0;
     }
 
     m_buffer.clear();
-    if (r) {
+    if (nbytes) {
 	notify(0, "replaced");
     } else {
 	Debug(&__plugin,DebugAll,"SndSource '%s' end of data (%u played) chan=%p [%p]",
@@ -748,16 +655,8 @@ void SndSource::notify(SndSource* source, const char* reason)
 
 SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen,
     const char* format, bool append, const NamedString* param)
-    : m_chan(chan),
-      m_stream(0),
-      m_total(0),
-      m_maxlen(maxlen),
-      m_time(0),
-      m_filename(file),
-      m_sndfile(0),
-      m_sf_format_set(false),
-      m_sf_raw(false),
-      m_valid(true)
+    : m_sndfile(0), m_chan(chan), m_stream(0), m_filename(file),
+      m_time(0), m_total(0), m_maxlen(maxlen), m_sf_format_set(false), m_valid(true)
 {
     Debug(&__plugin,DebugAll,"SndConsumer::SndConsumer(\"%s\",%p,%u,\"%s\",%s,%p) [%p]",
 	file.c_str(),chan,maxlen,format,String::boolText(append),param,this);
@@ -912,26 +811,9 @@ bool SndConsumer::setFormat(const DataFormat& format)
 	}
     }
 
-    /*
-     * Check to see if the format the endpoint is offering is *exactly*
-     * identical to the on-disk format. If so, we can do raw writes and avoid
-     * an a->b->a series of conversions.
-     *
-     * Exception: Endianness of PCM. As writing it through shorts is basically
-     * raw when endianness is the same, just ignore it.
-     */
-    m_sf_raw = (ep_info.format != SF_FORMAT_PCM_16 &&
-		ep_info.format && ep_info.channels && ep_info.samplerate &&
-		ep_info.format == (m_info.format & SF_FORMAT_SUBMASK) &&
-		ep_info.channels == m_info.channels &&
-		ep_info.samplerate == m_info.samplerate);
-
     if (m_format != format) {
 	DataFormat tmp(m_format);
-	if (m_sf_raw)
-	    m_format = format;
-	else
-	    m_format = sf_info_to_format(m_info);
+	m_format = sf_info_to_format(m_info);
 	Debug(&__plugin,DebugInfo,"Consumer format changed from %s to %s",tmp.c_str(), m_format.c_str());
 	return m_format == format;
     }
@@ -988,11 +870,11 @@ unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, 
 	sf_count_t nsamp;
 	if (!m_time)
 	    m_time = Time::now();
-	if (m_sf_raw)
-	    nsamp = sf_write_raw(m_sndfile, data.data(), data.length());
-	else
-	    nsamp = sf_write_short(m_sndfile, (short *)data.data(), data.length() / 2) * 2;
+
+	nsamp = data.length() / 2;
+	nsamp = sf_write_short(m_sndfile, (short *)data.data(), nsamp) * 2;
 	m_total += nsamp;
+
 	if (m_maxlen && (m_total >= m_maxlen)) {
 	    m_maxlen = 0;
 	    delete m_stream;
@@ -1482,6 +1364,11 @@ SndFileDriver::SndFileDriver()
     Output("Loaded module SndFile - Based on %s", buffer);
 }
 
+SndFileDriver::~SndFileDriver()
+{
+    Output("Unloading module SndFile");
+}
+
 void SndFileDriver::initialize()
 {
     Output("Initializing module SndFile");
@@ -1493,7 +1380,7 @@ void SndFileDriver::initialize()
     }
 }
 
-bool SndFileDriver::unload(bool unloadNow)
+bool SndFileDriver::tryUnload()
 {
     s_mutex.lock();
     if (s_reading || s_writing) {
@@ -1501,11 +1388,9 @@ bool SndFileDriver::unload(bool unloadNow)
 	return false;
     }
     s_mutex.unlock();
-
     Engine::uninstall(m_attachHandler);
     Engine::uninstall(m_recHandler);
     uninstallRelays();
-
     return true;
 }
 
