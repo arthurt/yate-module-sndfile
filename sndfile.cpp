@@ -386,7 +386,7 @@ void SndSource::init(const String& file, bool autorepeat)
 
 	String &tmp_file(*static_cast<String*>(m_assets->get()));
 
-	m_info.seekable = 1;
+	memset(&m_info, 0, sizeof(m_info));
 	m_sndfile = sf_open(tmp_file.c_str(), SFM_READ, &m_info);
 
 	/* If the file type couldn't be detected, try and guess based on it's
