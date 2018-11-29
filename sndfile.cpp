@@ -25,6 +25,28 @@
 
 #include <string.h>
 
+
+/*
+ * A word about data formats. There are two data formats that we care about
+ * when playing or recording from a file. They are the on-disk format that
+ * libsndfile reads/writes in and the format of the DataEndpoints use to send
+ * data around in Yate.
+ *
+ * libsndfile's API allows for data to be read/written as PCM shorts, ints,
+ * floats or doubles, and it bothers with whatever conversion or encoding is
+ * necessary for the on-disk format. Thus, most of the time it makes sense just
+ * to set the DataEndpoints to "slin".
+ *
+ * However, libsndfile also contains a raw read/write functionality, and there
+ * are a few situations when an unnecessary conversion can be avoided by
+ * exposing the on-disk format into Yate and using raw reads/writes. For
+ * example, consider a call with mulaw audio. When playing a file to such a
+ * call, if the file is also mulaw, it makes little sense to go
+ * mulaw->slin->mulaw, so be reading the data raw and presenting it to yate as
+ * mulaw we can avoid the unnecessary conversion. These are special cases
+ * though.
+ */
+
 using namespace TelEngine;
 namespace { // anonymous
 
@@ -44,6 +66,8 @@ static TokenDict sf_subtypes[] = {
     { "g723_32", SF_FORMAT_G721_32 },
     { "g723_40", SF_FORMAT_G723_40 },
     { "vorbis", SF_FORMAT_VORBIS },
+    { "A", SF_FORMAT_ALAW },
+    { "u", SF_FORMAT_ULAW },
     { "u8", SF_FORMAT_PCM_U8 },
     { "s8", SF_FORMAT_PCM_S8 },
     { "s16", SF_FORMAT_PCM_16 },
@@ -61,6 +85,7 @@ public:
     virtual void run();
     virtual void cleanup();
     virtual void attached(bool added);
+    //virtual void control(NamedList& param);
     void setNotify(const String& id);
 private:
     SndSource(CallEndpoint* chan, bool autoclose);
@@ -296,7 +321,6 @@ static SF_VIRTUAL_IO yate_vio = {
     yate_vio_tell
 };
 
-
 SndSource* SndSource::create(const String& file, CallEndpoint* chan, bool autoclose, bool autorepeat, const NamedString* param)
 {
     SndSource* tmp = new SndSource(chan,autoclose);
@@ -334,12 +358,54 @@ void SndSource::init(const String& file, bool autorepeat)
 	    return;
 	}
 
+	/* Need a parser */
+
 	m_assets = file.split(',',false);
 
 	String &tmp_file(*static_cast<String*>(m_assets->get()));
 
 	m_info.seekable = 1;
 	m_sndfile = sf_open(tmp_file.c_str(), SFM_READ, &m_info);
+
+	/* If the file type couldn't be detected, try and guess based on it's
+	** extension.
+	**/
+	if (!m_sndfile) {
+	    const char *s;
+
+	    s = strrchr(tmp_file.c_str(), '/');
+	    if (!s)
+		s = strrchr(tmp_file.c_str(), '.');
+	    else
+		s = strrchr(s, '.');
+	    if (s)
+		s++;
+	    if (s) {
+		const FormatInfo *fi = NULL;
+		String extension(s);
+
+		DDebug(&__plugin,DebugAll,"Looking up extension %s",s);
+		fi = FormatRepository::getFormat(extension);
+
+		if (fi && fi->dataRate()) {
+		    DDebug(&__plugin,DebugAll,"Found a format info of '%s' (%s)", fi->name, fi->type);
+		    m_info.samplerate = fi->sampleRate;
+		    m_info.channels = fi->numChannels;
+		    m_info.format = SF_FORMAT_RAW | lookup(fi->name, sf_subtypes);
+		}
+	    }
+
+	    if (!sf_format_check(&m_info)) {
+		m_info.samplerate = 8000;
+		m_info.channels = 1;
+		m_info.format = SF_FORMAT_RAW | SF_FORMAT_PCM_16;
+	    }
+
+	    Debug(&__plugin,DebugMild,"Couldn't detect format of '%s', assuming raw %s.",
+		tmp_file.c_str(), sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK));
+
+	    m_sndfile = sf_open(tmp_file.c_str(), SFM_READ, &m_info);
+	}
     }
 
     if (!m_sndfile) {
@@ -446,11 +512,12 @@ void SndSource::run()
     bool noChan = (0 == m_chan);
 
     // wait until at least one consumer is attached
-    while (!r) {
+    for (;;) {
 	lock();
 	r = m_consumers.count();
 	unlock();
-	Thread::yield();
+	if (!r)
+	    Thread::idle();
 	if (!looping(noChan)) {
 	    notify(0,"replaced");
 	    return;
@@ -465,7 +532,6 @@ void SndSource::run()
     m_time = tpos;
     unsigned long flags = 0;
 
-again:
     while (looping(noChan)) {
 
 	if (m_nodata) {
@@ -488,12 +554,12 @@ again:
 	if (!r) {
 	    if (m_repeatPos >= 0) {
 		if (m_total == last_repeate) {
-		    Debug(&__plugin,DebugWarn,"Asked to autorepeate over no data! Exiting.");
+		    Debug(&__plugin,DebugWarn,"Asked to autorepeat over no data! Exiting.");
 		    break;
 		}
 
 		if (sf_seek(m_sndfile, m_repeatPos, SEEK_SET) < 0) {
-		    Debug(&__plugin,DebugWarn,"Asked to autorepeate, but cannot seek in file! Exiting.");
+		    Debug(&__plugin,DebugWarn,"Asked to autorepeat, but cannot seek in file! Exiting.");
 		    break;
 		}
 
@@ -504,7 +570,41 @@ again:
 		flags |= DataNode::DataMark;
 		continue;
 	    }
-	    break;
+
+	    /* If a prompt, try and load the next file. */
+	    if (m_assets) {
+		for (m_assets->remove(); m_assets->length(); m_assets->remove()) {
+		    String* next_file(static_cast<String *>(m_assets->get()));
+		    SF_INFO new_info;
+
+		    if (m_sndfile) {
+			sf_close(m_sndfile);
+			m_sndfile = NULL;
+		    }
+
+		    if (!next_file)
+			break;
+
+		    m_sndfile = sf_open(next_file->c_str(), SFM_READ, &new_info);
+		    if (m_sndfile) {
+			if (new_info.samplerate == m_info.samplerate &&
+			    new_info.channels == m_info.channels &&
+			    new_info.format == m_info.format) {
+			    memcpy(&m_info, &new_info, sizeof(SF_INFO));
+			    Debug(&__plugin,DebugAll,"SndSource '%s' playing next file \"%s\"", m_id.c_str(),next_file->c_str());
+			    break;
+			} else {
+			    Debug(&__plugin,DebugWarn,"SndSource '%s' cannot string files of difference formats!", m_id.c_str());
+			}
+		    } else {
+			Debug(&__plugin,DebugWarn,"Opening '%s' for reading: %s",next_file->c_str(),sf_strerror(NULL));
+		    }
+		}
+		if (m_sndfile)
+		    continue;
+		else
+		    break;
+	    }
 	}
 
 	if (r < (int)m_data.length()) {
@@ -537,35 +637,12 @@ again:
 
     if (r)
 	notify(0,"replaced");
-    else {
-	if (m_assets) {
-	    String* next_file;
-	    m_assets->remove();
 
-	    next_file = static_cast<String *>(m_assets->get());
-
-	    if (next_file) {
-		SF_INFO new_info;
-
-		sf_close(m_sndfile);
-		m_sndfile = sf_open(next_file->c_str(), SFM_READ, &new_info);
-
-		if (new_info.samplerate == m_info.samplerate &&
-		    new_info.channels == m_info.channels &&
-		    new_info.format == m_info.format) {
-		    memcpy(&m_info, &new_info, sizeof(SF_INFO));
-		    Debug(&__plugin,DebugAll,"SndSource '%s' playing next file \"%s\"", m_id.c_str(),next_file->c_str());
-		    goto again;
-		}
-	    }
-	}
-
-	Debug(&__plugin,DebugAll,"SndSource '%s' end of data (%u played) chan=%p [%p]",
-	    m_id.c_str(),m_total,m_chan,this);
-	m_data.clear();
-	Forward(m_data, ts, (unsigned long)DataNode::DataEnd);
-	notify(this, "eof");
-    }
+    Debug(&__plugin,DebugAll,"SndSource '%s' end of data (%u played) chan=%p [%p]",
+	m_id.c_str(),m_total,m_chan,this);
+    m_data.clear();
+    Forward(m_data, ts, (unsigned long)DataNode::DataEnd);
+    notify(this, "eof");
 }
 
 void SndSource::cleanup()
