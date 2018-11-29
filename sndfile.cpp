@@ -1,6 +1,6 @@
 /**
- * wavefile.cpp
- * This file is part of the YATE Project http://YATE.null.ro
+ * sndfile.cpp
+ * This file is based on work from the YATE Project http://YATE.null.ro
  *
  * Snd file driver (record+playback)
  *
@@ -52,7 +52,6 @@ private:
     String m_id;
     bool m_autoclose;
     bool m_nodata;
-
     SNDFILE* m_sndfile;
     SF_INFO m_info;
     bool m_sndfile_raw;
@@ -61,32 +60,32 @@ private:
 class SndConsumer : public DataConsumer
 {
 public:
-    enum Header {
-	None = 0,
-	Au,
-	Ilbc,
-    };
     SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen,
 	const char* format, bool append, const NamedString* param);
     ~SndConsumer();
     virtual bool setFormat(const DataFormat& format);
     virtual unsigned long Consume(const DataBlock& data, unsigned long tStamp, unsigned long flags);
     virtual void attached(bool added);
+    //virtual bool valid() const;
+    //virtual bool control(NamedList& param);
     inline void setNotify(const String& id)
 	{ m_id = id; }
 private:
-    void writeIlbcHeader() const;
-    void writeAuHeader();
+    static bool parseFormat(const char *str, SF_INFO &info);
     CallEndpoint* m_chan;
     Stream* m_stream;
-    bool m_swap;
-    bool m_locked;
-    bool m_created;
-    Header m_header;
+
+    bool m_sf_format_set;
+    bool m_sf_raw;
+
     unsigned m_total;
     unsigned m_maxlen;
     uint64_t m_time;
     String m_id;
+
+    String m_filename;
+    SNDFILE* m_sndfile;
+    SF_INFO m_info;
 };
 
 class SndChan : public Channel
@@ -114,6 +113,7 @@ private:
 };
 
 class AttachHandler;
+class RecordHandler;
 
 class SndFileDriver : public Driver
 {
@@ -121,10 +121,12 @@ public:
     SndFileDriver();
     virtual void initialize();
     virtual bool msgExecute(Message& msg, String& dest);
+    bool unload(bool unloadNow);
 protected:
     void statusParams(String& str);
 private:
-    AttachHandler* m_handler;
+    AttachHandler* m_attachHandler;
+    RecordHandler* m_recHandler;
 };
 
 Mutex s_mutex(false,"SndFile");
@@ -132,9 +134,14 @@ int s_reading = 0;
 int s_writing = 0;
 bool s_dataPadding = true;
 bool s_pubReadable = false;
+static const Regexp s_formatParser("^(\\d+\\*)?([^/]+)(/\\d+)?$",true,true);
 
 INIT_PLUGIN(SndFileDriver);
 
+UNLOAD_PLUGIN(unloadNow)
+{
+    return __plugin.unload(unloadNow);
+}
 
 class AttachHandler : public MessageHandler
 {
@@ -154,35 +161,62 @@ public:
     virtual bool received(Message &msg);
 };
 
-
-typedef struct {
-    uint32_t sign;
-    uint32_t offs;
-    uint32_t len;
-    uint32_t form;
-    uint32_t freq;
-    uint32_t chan;
-} AuHeader;
-
-#define ILBC_HEADER_LEN 9
-
-static const char* ilbcFormat(Stream& stream)
+static String filename_get_extension(const String& filename)
 {
-    char header[ILBC_HEADER_LEN+1];
-    if (stream.readData(&header,ILBC_HEADER_LEN) == ILBC_HEADER_LEN) {
-	header[ILBC_HEADER_LEN] = '\0';
-	if (::strcmp(header,"#!iLBC20\n") == 0)
-	    return "ilbc20";
-	else if (::strcmp(header,"#!iLBC30\n") == 0)
-	    return "ilbc30";
+    int off;
+
+    off = filename.rfind('.');
+    if (off >= 0)
+	return filename.substr(off + 1);
+    return String::empty();
+}
+
+static int sf_guess_major(const char *extension)
+{
+    int k, count;
+    SF_FORMAT_INFO format_info;
+
+    sf_command(NULL, SFC_GET_FORMAT_MAJOR_COUNT, &count, sizeof(count));
+    for (k = 0; k < count; k++) {
+	format_info.format = k;
+	sf_command(NULL, SFC_GET_FORMAT_MAJOR, &format_info, sizeof(format_info));
+	if (!strcasecmp(extension, format_info.extension))
+	    return format_info.format;
     }
     return 0;
 }
+
+static DataFormat sf_info_to_format(const SF_INFO &m_info)
+{
+    String s;
+
+    if (m_info.channels != 0 && m_info.channels != 1)
+	s << m_info.channels << '*';
+
+    s << "slin";
+
+    if (m_info.samplerate != 0 && m_info.samplerate != 8000)
+	s << '/' << m_info.samplerate;
+
+    DataFormat format(s);
+
+    return format;
+}
+
+static const char* sf_format_id_name(int format)
+{
+    SF_FORMAT_INFO info;
+
+    info.format = format;
+    if (!sf_command(NULL, SFC_GET_FORMAT_INFO, &info, sizeof(info)))
+	return info.name;
+    return "(invalid)";
+}
+
 static sf_count_t yate_vio_get_filelen(void *user_data)
 {
     Stream* stream = static_cast<Stream*>(user_data);
     return stream->length();
-    return -1;
 }
 
 static sf_count_t yate_vio_seek(sf_count_t offset, int whence, void *user_data)
@@ -275,7 +309,7 @@ void SndSource::init(const String& file, bool autorepeat)
     }
 
     // Yate is really dumb, and only understands a few format... barely.
-    // We only try and read raw data for that which is understands
+    // We only try and read raw data for that which it understands
     // otherwise for everthing else we read as 8000Hz-mono-s16-pcm
 
     switch (m_info.format & SF_FORMAT_SUBMASK) {
@@ -289,14 +323,6 @@ void SndSource::init(const String& file, bool autorepeat)
 	    m_sndfile_raw = true;
 	    m_brate = 1;
 	    break;
-
-	/*
-	 * Would be nice, but can't read non-byte-multiple samples from sndfile.
-	case SF_FORMAT_GSM610:
-	case SF_FORMAT_G723_32:
-	case SF_FORMAT_G723_24:
-	case SF_FORMAT_G723_40:
-	 */
 
 	/*
 	 * For everything else, lie and let libsndfile convert it for us to
@@ -524,21 +550,28 @@ void SndSource::notify(SndSource* source, const char* reason)
     stop();
 }
 
-
 SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen,
     const char* format, bool append, const NamedString* param)
-    : m_chan(chan), m_stream(0), m_swap(false), m_locked(false), m_created(true), m_header(None),
-      m_total(0), m_maxlen(maxlen), m_time(0)
+    : m_chan(chan),
+      m_stream(0),
+      m_sf_format_set(false),
+      m_sf_raw(false),
+      m_total(0),
+      m_maxlen(maxlen),
+      m_time(0),
+      m_filename(file),
+      m_sndfile(0)
 {
     Debug(&__plugin,DebugAll,"SndConsumer::SndConsumer(\"%s\",%p,%u,\"%s\",%s,%p) [%p]",
 	file.c_str(),chan,maxlen,format,String::boolText(append),param,this);
+
     s_mutex.lock();
     s_writing++;
     s_mutex.unlock();
-    if (format) {
-	m_locked = true;
-	m_format = format;
-    }
+
+    memset(&m_info, 0, sizeof(m_info));
+
+/*  TODO
     NamedPointer* ptr = YOBJECT(NamedPointer,param);
     if (ptr) {
 	m_stream = YOBJECT(Stream,ptr);
@@ -547,68 +580,75 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
 	    ptr->takeData();
 	}
     }
-    if (file == "-")
-	return;
-    else if (file.endsWith(".gsm"))
-	m_format = "gsm";
-    else if (file.endsWith(".alaw") || file.endsWith(".A"))
-	m_format = "alaw";
-    else if (file.endsWith(".mulaw") || file.endsWith(".u"))
-	m_format = "mulaw";
-    else if (file.endsWith(".2slin"))
-	m_format = "2*slin";
-    else if (file.endsWith(".2alaw"))
-	m_format = "2*alaw";
-    else if (file.endsWith(".2mulaw"))
-	m_format = "2*mulaw";
-    else if (file.endsWith(".ilbc20"))
-	m_format = "ilbc20";
-    else if (file.endsWith(".ilbc30"))
-	m_format = "ilbc30";
-    else if (file.endsWith(".g729"))
-	m_format = "g729";
-    else if (file.endsWith(".lbc")) {
-	m_header = Ilbc;
-	if (!m_format.startsWith("ilbc"))
-	    m_locked = false;
-    }
-    else if (file.endsWith(".au"))
-	m_header = Au;
-    else if (!file.endsWith(".slin"))
-	Debug(DebugMild,"Unknown format for recorded file '%s', assuming signed linear",file.c_str());
-    if (m_stream)
-	return;
-    m_stream = new File;
-    if (!static_cast<File*>(m_stream)->openPath(file,true,append,true,append,true,s_pubReadable)) {
-	Debug(DebugWarn,"Creating '%s': error %d: %s",
-	    file.c_str(), m_stream->error(), ::strerror(m_stream->error()));
-	delete m_stream;
-	m_stream = 0;
-	return;
-    }
-    if (append && m_stream->seek(Stream::SeekEnd) > 0) {
-	// remember to skip writing the header when appending to non-empty file
-	m_created = false;
-	switch (m_header) {
-	    // TODO: Au
-	    case Ilbc:
-		if (m_stream->seek(0) == 0) {
-		    const char* fmt = ilbcFormat(*m_stream);
-		    m_stream->seek(Stream::SeekEnd);
-		    if (fmt) {
-			if (m_format != fmt)
-			    Debug(DebugInfo,"Detected format %s for file '%s'",fmt,file.c_str());
-			m_locked = true;
-			m_format = fmt;
-		    }
-		    else
-			Debug(DebugMild,"Could not detect iLBC format of '%s'",file.c_str());
-		}
-		break;
-	    default:
-		break;
+*/
+    /* Try and get the filetype & encoding from the file to append. */
+    if (append && File::exists(file.c_str()) && !format) {
+	m_sndfile = sf_open(file.c_str(), SFM_RDWR, &m_info);
+
+	if (m_sndfile) {
+	    if (sf_seek(m_sndfile, 0, SEEK_END != 0)) {
+		Debug(DebugWarn,"Cannot seek in %s: %s\n", file.c_str(),sf_strerror(m_sndfile));
+		// ERROR STATE
+		return;
+	    }
+	    m_sf_format_set = true;
 	}
     }
+
+    if (!m_sndfile) {
+	String extension(filename_get_extension(file).toLower());
+
+	/* Guess the filetype (container) from the filename. */
+	if (!(m_info.format & SF_FORMAT_TYPEMASK)) {
+	    int type = sf_guess_major(extension.c_str());
+	    if (type)
+		m_info.format |= type;
+	    else
+		m_info.format |= SF_FORMAT_RAW;
+	}
+
+	/* User-specified on-disk encoding. */
+	if (format) {
+	    if (parseFormat(format, m_info)) {
+		if (sf_format_check(&m_info)) {
+		    m_sf_format_set = true;
+		} else {
+		    Debug(DebugWarn,"Combination of %s in %s is not valid!",
+			sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK),
+			sf_format_id_name(m_info.format & SF_FORMAT_TYPEMASK));
+		}
+	    }
+	}
+
+	/* If raw and we still don't have an encoding, use the extension as a hint. */
+	if (m_info.format == SF_FORMAT_RAW) {
+	    if (extension == "alaw") {
+		m_info.format |= SF_FORMAT_ALAW;
+	    } else if (extension == "mulaw" || extension == "ulaw") {
+		m_info.format |= SF_FORMAT_ULAW;
+	    } else if (extension == "gsm") {
+		m_info.format |= SF_FORMAT_GSM610;
+	    } else if (extension == "slin" || extension == "sln")
+		m_info.format |= SF_FORMAT_PCM_16;
+	}
+
+	if (append && File::exists(file.c_str())) {
+	    m_sndfile = sf_open(file.c_str(), SFM_RDWR, &m_info);
+	    if (!m_sndfile || sf_seek(m_sndfile, 0, SEEK_END != 0)) {
+		Debug(DebugWarn,"Cannot append to %s: %s",file.c_str(),sf_strerror(m_sndfile));
+		// TODO ERROR STATE:
+		return;
+	    } else {
+		m_sf_format_set = true;
+	    }
+	}
+    }
+
+    if (m_sf_format_set) {
+	m_format = sf_info_to_format(m_info);
+    }
+
+    /* If sf_format_set is false still, it will be set by the first call to setFormat */
 }
 
 SndConsumer::~SndConsumer()
@@ -621,119 +661,104 @@ SndConsumer::~SndConsumer()
 	    Debug(&__plugin,DebugInfo,"SndConsumer rate=" FMT64U " b/s",m_time);
 	}
     }
-    delete m_stream;
+    if (m_sndfile)
+	sf_close(m_sndfile);
+    if (m_stream)
+	delete m_stream;
     m_stream = 0;
+
+
     s_mutex.lock();
     s_writing--;
     s_mutex.unlock();
 }
 
-void SndConsumer::writeIlbcHeader() const
-{
-    if (m_format == "ilbc20")
-	m_stream->writeData("#!iLBC20\n",ILBC_HEADER_LEN);
-    else if (m_format == "ilbc30")
-	m_stream->writeData("#!iLBC30\n",ILBC_HEADER_LEN);
-    else
-	Debug(DebugMild,"Invalid iLBC format '%s', not writing header",m_format.c_str());
-}
-
-void SndConsumer::writeAuHeader()
-{
-    AuHeader header;
-    String fmt = m_format;
-    int chans = 1;
-    int rate = 8000;
-    int sep = fmt.find('*');
-    if (sep > 0)
-	fmt >> chans >> "*";
-    sep = fmt.find('/');
-    if (sep > 0) {
-	rate = fmt.substr(sep+1).toInteger(rate);
-	fmt.assign(fmt,sep);
-    }
-    if (fmt == "slin") {
-	m_swap = true;
-	header.form = htonl(3);
-    }
-    else if (fmt == "mulaw")
-	header.form = htonl(1);
-    else if (fmt == "alaw")
-	header.form = htonl(27);
-    else {
-	Debug(DebugMild,"Invalid au format '%s', not writing header",m_format.c_str());
-	return;
-    }
-    header.sign = htonl(0x2E736E64);
-    header.offs = htonl(sizeof(header));
-    header.freq = htonl(rate);
-    header.chan = htonl(chans);
-    header.len = 0;
-    m_stream->writeData(&header,sizeof(header));
-}
-
+/* This is the format the other endpoint wants to send us, not necessarily what
+ * encoding the file is. If sf_format_set is still false, try and use this
+ * format for the on-disk encoding.
+ *
+ * Also, the return value is special. True if the format changed, false
+ * if it didn't, either because we don't support it or it was the same.
+ */
 bool SndConsumer::setFormat(const DataFormat& format)
 {
-    if (m_locked || (format == "slin"))
-	return false;
+    SF_INFO ep_info = { 0 };
     bool ok = false;
-    switch (m_header) {
-	case Ilbc:
-	    if ((format == "ilbc20") || (format == "ilbc30"))
-		ok = true;
-	    else if (!m_format.startsWith("ilbc")) {
-		m_format = "ilbc20";
-		Debug(DebugNote,"SndConsumer switching to default '%s'",m_format.c_str());
-	    }
-	    break;
-	case Au:
-	    if ((format.find("mulaw") >= 0) || (format.find("alaw") >= 0) || (format.find("slin") >= 0))
-		ok = true;
-	    break;
-	default:
-	    break;
+
+    Debug(&__plugin,DebugAll,"SndConsumer::setFormat \"%s\"",format.c_str());
+
+    /* If writing raw, cannot change the format now. */
+    if (m_sf_raw)
+	return false;
+
+    if (!parseFormat(format.c_str(), ep_info))
+	return false;
+
+    /* If we haven't yet set an on-disk encoding, try this one. */
+    if (!m_sf_format_set) {
+	int subfmt = m_info.format & SF_FORMAT_SUBMASK;
+	if ((!m_info.channels || m_info.channels == ep_info.channels) &&
+	    (!m_info.samplerate || m_info.samplerate == ep_info.samplerate) &&
+	    (!subfmt || subfmt == ep_info.format))
+	{
+	    m_info.channels = ep_info.channels;
+	    m_info.samplerate = ep_info.samplerate;
+	    m_info.format |= ep_info.format;
+
+	    ok = true;
+	    m_sf_format_set = true;
+	}
     }
-    if (ok) {
-	DDebug(DebugInfo,"SndConsumer new format '%s'",format.c_str());
-	m_format = format;
-	m_locked = true;
-	return true;
+
+    /* Check to see if the format is *exactly* what we are writing, and if so
+     * switch to writing it raw to avoid a->b->a conversions. Avoid raw PCM,
+     * as in most cases it is pass-through, except for endian-ness issues.
+     */
+    if (ep_info.format != SF_FORMAT_PCM_16 &&
+	ep_info.format == (m_info.format & SF_FORMAT_SUBMASK) &&
+	ep_info.channels == m_info.channels &&
+	ep_info.samplerate == m_info.samplerate)
+    {
+	m_sf_raw = true;
+	if (m_format != format) {
+	    m_format = format;
+	    return true;
+	}
     }
+
+    if (ok && m_format != format) {
+	m_format = sf_info_to_format(m_info);
+	return m_format == format;
+    }
+
+    /* Return false if nothing changed (reguardless of success or failure.) */
     return false;
 }
 
 unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, unsigned long flags)
 {
+    if (!m_sndfile) {
+	if (!(m_info.format & SF_FORMAT_SUBMASK))
+	    m_info.format |= SF_FORMAT_PCM_16;
+	Debug(&__plugin,DebugInfo,"Opened %s file \"%s\" for writing %s\n",
+	    sf_format_id_name(m_info.format & SF_FORMAT_TYPEMASK),
+	    m_filename.c_str(),
+	    sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK));
+	m_sndfile = sf_open(m_filename.c_str(), SFM_WRITE, &m_info);
+	if (!m_sndfile) {
+	    Debug(&__plugin,DebugWarn,"Could not open \"%s\" for writing: %s",m_filename.c_str(),sf_strerror(m_sndfile));
+	    return 0;
+	}
+    }
     if (!data.null()) {
+	sf_count_t nsamp;
 	if (!m_time)
 	    m_time = Time::now();
-	if (m_stream) {
-	    if (m_created) {
-		m_created = false;
-		switch (m_header) {
-		    case Ilbc:
-			writeIlbcHeader();
-			break;
-		    case Au:
-			writeAuHeader();
-			break;
-		    default:
-			break;
-		}
-	    }
-	    if (m_swap) {
-		unsigned int n = data.length();
-		DataBlock swapped(0,n);
-		const uint16_t* s = (const uint16_t*)data.data();
-		uint16_t* d = (uint16_t*)swapped.data();
-		for (unsigned int i = 0; i < n; i+= 2)
-		    *d++ = htons(*s++);
-		m_stream->writeData(swapped);
-	    }
-	    else
-		m_stream->writeData(data);
-	}
-	m_total += data.length();
+	if (m_sf_raw)
+	    nsamp = sf_write_raw(m_sndfile, data.data(), data.length());
+	else
+	    nsamp = sf_write_short(m_sndfile, (short *)data.data(), data.length() / 2) * 2;
+	m_total += nsamp;
 	if (m_maxlen && (m_total >= m_maxlen)) {
 	    m_maxlen = 0;
 	    delete m_stream;
@@ -763,6 +788,45 @@ void SndConsumer::attached(bool added)
 	DDebug(&__plugin,DebugInfo,"SndConsumer clearing dead chan %p [%p]",m_chan,this);
 	m_chan = 0;
     }
+}
+
+bool SndConsumer::parseFormat(const char *str, SF_INFO &info)
+{
+    String fmt(str);
+    String rate;
+
+    if (!fmt.matches(s_formatParser)) {
+	Debug(&__plugin,DebugWarn,"Cannot parse \"%s\"", str);
+	return false;
+    }
+
+    String encoding(fmt.matchString(2));
+    if (encoding == "slin")
+	info.format |= SF_FORMAT_PCM_16;
+    else if (encoding == "mulaw")
+	info.format |= SF_FORMAT_ULAW;
+    else if (encoding == "alaw")
+	info.format |= SF_FORMAT_ALAW;
+    else if (encoding == "gsm")
+	info.format |= SF_FORMAT_GSM610;
+    else if (encoding == "g726" || encoding == "g721" || encoding == "g726_32")
+	info.format |= SF_FORMAT_G721_32;
+    else if (encoding == "vorbis")
+	info.format |= SF_FORMAT_VORBIS;
+    else {
+	info.format |= SF_FORMAT_PCM_16;
+	Debug(&__plugin,DebugMild,"Format encoding \"%s\" not understood.",encoding.c_str());
+    }
+
+    rate = fmt.matchString(3) >> "/";
+    info.channels = fmt.matchString(1).toInteger(1);
+    info.samplerate = rate.toInteger(8000);
+
+    Debug(&__plugin,DebugInfo,"%s %s %s --> %d %x %d \n",
+	fmt.matchString(1).c_str(),fmt.matchString(2).c_str(),rate.c_str(),
+	info.channels, info.format, info.samplerate);
+
+    return true;
 }
 
 
@@ -1205,7 +1269,7 @@ void SndFileDriver::statusParams(String& str)
 }
 
 SndFileDriver::SndFileDriver()
-    : Driver("snd","misc"), m_handler(0)
+    : Driver("snd","misc"), m_attachHandler(0), m_recHandler(0)
 {
     Output("Loaded module SndFile");
 }
@@ -1216,11 +1280,26 @@ void SndFileDriver::initialize()
     setup();
     s_dataPadding = Engine::config().getBoolValue("hacks","datapadding",true);
     s_pubReadable = Engine::config().getBoolValue("hacks","wavepubread",false);
-    if (!m_handler) {
-	m_handler = new AttachHandler;
-	Engine::install(m_handler);
-	Engine::install(new RecordHandler);
+    if (!m_attachHandler) {
+	Engine::install((m_attachHandler = new AttachHandler));
+	Engine::install((m_recHandler = new RecordHandler));
     }
+}
+
+bool SndFileDriver::unload(bool unloadNow)
+{
+    s_mutex.lock();
+    if (s_reading || s_writing) {
+	s_mutex.unlock();
+	return false;
+    }
+    s_mutex.unlock();
+
+    Engine::uninstall(m_attachHandler);
+    Engine::uninstall(m_recHandler);
+    uninstallRelays();
+
+    return true;
 }
 
 }; // anonymous namespace

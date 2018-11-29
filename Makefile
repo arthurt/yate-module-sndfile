@@ -1,9 +1,9 @@
 CC = gcc
 CXX = g++
 LD = g++
-CFLAGS = -g -Wall
+CFLAGS = -g -Wall -DDEBUG
 CPPFLAGS =
-CXXFLAGS = -g -Wall
+CXXFLAGS = -g -Wall -DDEBUG
 LDFLAGS =
 INCL =
 LIBS = -lsndfile
