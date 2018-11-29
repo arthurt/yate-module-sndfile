@@ -35,8 +35,8 @@ static TokenDict sf_subtypes[] = {
     { "ima", SF_FORMAT_IMA_ADPCM },
     { "msadpcm", SF_FORMAT_MS_ADPCM },
     { "gsm", SF_FORMAT_GSM610 },
-    { "g721", SF_FORMAT_G721_32 },
     { "g726", SF_FORMAT_G721_32 },
+    { "g721", SF_FORMAT_G721_32 },
     { "g726_24", SF_FORMAT_G723_24 },
     { "g726_32", SF_FORMAT_G721_32 },
     { "g726_40", SF_FORMAT_G723_40 },
@@ -158,8 +158,7 @@ Mutex s_mutex(false,"SndFile");
 int s_reading = 0;
 int s_writing = 0;
 bool s_dataPadding = true;
-bool s_pubReadable = false;
-static const Regexp s_formatParser("^(\\d+\\*)?([^/]+)(/\\d+)?$",true,true);
+static const Regexp s_formatParser("^([0-9]+\\*)?([^/]+)(/[0-9]+)?$",true,true);
 
 INIT_PLUGIN(SndFileDriver);
 
@@ -691,10 +690,9 @@ bool SndConsumer::setFormat(const DataFormat& format)
 {
     SF_INFO ep_info = { 0 };
 
-    Debug(&__plugin,DebugAll,"SndConsumer::setFormat \"%s\"",format.c_str());
+    DDebug(&__plugin,DebugAll,"SndConsumer::setFormat \"%s\"",format.c_str());
 
-    if (!parseFormat(format.c_str(), ep_info))
-	return false;
+    parseFormat(format.c_str(), ep_info);
 
     /* If we haven't yet set an on-disk encoding/rate/channel, try to match
      * this as closely as possible. */
@@ -723,16 +721,18 @@ bool SndConsumer::setFormat(const DataFormat& format)
      * raw when endianness is the same, just ignore it.
      */
     m_sf_raw = (ep_info.format != SF_FORMAT_PCM_16 &&
-		ep_info.channels && ep_info.samplerate &&
+		ep_info.format && ep_info.channels && ep_info.samplerate &&
 		ep_info.format == (m_info.format & SF_FORMAT_SUBMASK) &&
 		ep_info.channels == m_info.channels &&
 		ep_info.samplerate == m_info.samplerate);
 
     if (m_format != format) {
+	DataFormat tmp(m_format);
 	if (m_sf_raw)
 	    m_format = format;
 	else
 	    m_format = sf_info_to_format(m_info);
+	Debug(&__plugin,DebugInfo,"Format changed from %s to %s",tmp.c_str(), m_format.c_str());
 	return m_format == format;
     }
 
@@ -760,7 +760,7 @@ unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, 
 		    sf_command(NULL, SFC_GET_FORMAT_SUBTYPE, &info, sizeof(info));
 
 		    /* Hack: skip 8-bit audio... */
-		    if (m_info.format == SF_FORMAT_PCM_S8)
+		    if (info.format == SF_FORMAT_PCM_S8)
 			continue;
 
 		    m_info.format = (m_info.format & SF_FORMAT_TYPEMASK) | info.format;
@@ -841,7 +841,7 @@ bool SndConsumer::parseFormat(const char *str, SF_INFO &info)
 
     info.format |= lookup(encoding, sf_subtypes, 0);
 
-    DDebug(&__plugin,DebugInfo,"%s %s %s --> %d %x %d \n",
+    XDebug(&__plugin,DebugAll,"%s %s %s --> %d %x %d \n",
 	fmt.matchString(1).c_str(),fmt.matchString(2).c_str(),fmt.matchString(3).c_str(),
 	info.channels, info.format, info.samplerate);
 
@@ -1301,7 +1301,6 @@ void SndFileDriver::initialize()
     Output("Initializing module SndFile");
     setup();
     s_dataPadding = Engine::config().getBoolValue("hacks","datapadding",true);
-    s_pubReadable = Engine::config().getBoolValue("hacks","wavepubread",false);
     if (!m_attachHandler) {
 	Engine::install((m_attachHandler = new AttachHandler));
 	Engine::install((m_recHandler = new RecordHandler));
