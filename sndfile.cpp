@@ -63,19 +63,26 @@ public:
     virtual void attached(bool added);
     void setNotify(const String& id);
 private:
-    SndSource(const char* file, CallEndpoint* chan, bool autoclose);
+    SndSource(CallEndpoint* chan, bool autoclose);
     void init(const String& file, bool autorepeat);
     void notify(SndSource* source, const char* reason = 0);
+
     CallEndpoint* m_chan;
     Stream* m_stream;
+    ObjList* m_assets;
     DataBlock m_data;
+
     unsigned m_brate;
     int64_t m_repeatPos;
     unsigned m_total;
     uint64_t m_time;
+
     String m_id;
+
     bool m_autoclose;
     bool m_nodata;
+
+    // libsndfile members
     SNDFILE* m_sndfile;
     SF_INFO m_info;
     bool m_sndfile_raw;
@@ -292,7 +299,7 @@ static SF_VIRTUAL_IO yate_vio = {
 
 SndSource* SndSource::create(const String& file, CallEndpoint* chan, bool autoclose, bool autorepeat, const NamedString* param)
 {
-    SndSource* tmp = new SndSource(file,chan,autoclose);
+    SndSource* tmp = new SndSource(chan,autoclose);
     NamedPointer* ptr = YOBJECT(NamedPointer,param);
     if (ptr) {
 	Stream* stream = YOBJECT(Stream,ptr);
@@ -316,7 +323,6 @@ SndSource* SndSource::create(const String& file, CallEndpoint* chan, bool autocl
 
 void SndSource::init(const String& file, bool autorepeat)
 {
-    memset(&m_info, 0, sizeof(SF_INFO));
     if (m_stream) {
 	m_sndfile = sf_open_virtual(&yate_vio, SFM_READ, &m_info, m_stream);
     } else {
@@ -327,41 +333,50 @@ void SndSource::init(const String& file, bool autorepeat)
 	    start("Snd Source");
 	    return;
 	}
+
+	m_assets = file.split(',',false);
+
+	String &tmp_file(*static_cast<String*>(m_assets->get()));
+
 	m_info.seekable = 1;
-	m_sndfile = sf_open(file.c_str(), SFM_READ, &m_info);
+	m_sndfile = sf_open(tmp_file.c_str(), SFM_READ, &m_info);
     }
 
     if (!m_sndfile) {
-	Debug(DebugWarn,"Opening '%s' for reading: %s",file.c_str(),sf_strerror(NULL));
+	Debug(&__plugin,DebugWarn,"Opening '%s' for reading: %s",file.c_str(),sf_strerror(NULL));
 	notify(this,"error");
 	return;
     }
 
-    m_format = "";
-    if (m_info.channels != 1)
-	m_format << m_info.channels << "*";
+    String native_format;
+    const FormatInfo *fi = NULL;
+    const char *yate_format_name = lookup(m_info.format & SF_FORMAT_SUBMASK, sf_subtypes);
 
-    switch (m_info.format & SF_FORMAT_SUBMASK) {
-	case SF_FORMAT_ULAW:
-	    m_format << "mulaw";
-	    m_sndfile_raw = true;
-	    m_brate = 1;
-	    break;
-	case SF_FORMAT_ALAW:
-	    m_format << "alaw";
-	    m_sndfile_raw = true;
-	    m_brate = 1;
-	    break;
-
-	default:
-	    m_sndfile_raw = false;
-	    m_format << "slin";
-	    m_brate = 2;
-	    break;
+    // Look up if Yate handles this internally. The allows us to possibly avoid
+    // unnecisarry conversions. Re: g726 file -> slin -> g726 call is dumb.
+    if (yate_format_name) {
+        if (m_info.channels != 1)
+	    native_format << m_info.channels << "*";
+	native_format << yate_format_name;
+	if (m_info.samplerate != 8000)
+	    native_format << "/" << m_info.samplerate;
+	fi = FormatRepository::getFormat(native_format);
     }
-    if (m_info.samplerate != 8000)
-	m_format << "/" << m_info.samplerate;
-    m_brate *= (m_info.samplerate * m_info.channels);
+
+    if (fi && fi->dataRate() != 0) {
+	m_format = native_format;
+	m_sndfile_raw = true;
+	m_brate = fi->dataRate();
+    } else {
+	m_format = "";
+	if (m_info.channels != 1)
+	    m_format << m_info.channels << "*";
+	m_format << "slin";
+	if (m_info.samplerate != 8000)
+	    m_format << "/" << m_info.samplerate;
+	m_sndfile_raw = false;
+	m_brate = 2 * m_info.channels * m_info.samplerate;
+    }
 
     XDebug(&__plugin,DebugAll, "\n"
 "========== Info ============\n"
@@ -374,18 +389,22 @@ void SndSource::init(const String& file, bool autorepeat)
 "Yate Format: %s",
     m_info.frames, m_info.samplerate, m_info.channels, m_info.format, m_info.sections, m_info.seekable, m_format.c_str());
 
-    if (autorepeat)
-	m_repeatPos = sf_seek(m_sndfile, 0, SEEK_CUR);
+    if (autorepeat) {
+	if (m_info.seekable)
+	    m_repeatPos = 0;
+	else
+	    Debug(&__plugin,DebugWarn,"Cannot autorepeat a non-seekable file/stream");
+    }
     start("Snd Source");
 }
 
-SndSource::SndSource(const char* file, CallEndpoint* chan, bool autoclose)
-    : m_chan(chan), m_stream(0), m_brate(0), m_repeatPos(-1),
-      m_total(0), m_time(0), m_autoclose(autoclose),
-      m_nodata(false),
+SndSource::SndSource(CallEndpoint* chan, bool autoclose)
+    : m_chan(chan), m_stream(0), m_assets(0), m_brate(0), m_repeatPos(-1),
+      m_total(0), m_time(0), m_autoclose(autoclose), m_nodata(false),
       m_sndfile(0), m_sndfile_raw(false)
 {
-    Debug(&__plugin,DebugAll,"SndSource::SndSource(\"%s\",%p) [%p]",file,chan,this);
+    Debug(&__plugin,DebugAll,"SndSource::SndSource(%p) [%p]",chan,this);
+    memset(&m_info, 0, sizeof(SF_INFO));
     s_mutex.lock();
     s_reading++;
     s_mutex.unlock();
@@ -410,6 +429,10 @@ SndSource::~SndSource()
 	delete m_stream;
 	m_stream = 0;
     }
+    if (m_assets) {
+	delete m_assets;
+	m_assets = 0;
+    }
     s_mutex.lock();
     s_reading--;
     s_mutex.unlock();
@@ -418,9 +441,10 @@ SndSource::~SndSource()
 void SndSource::run()
 {
     unsigned long ts = 0;
-    int r = 0;
+    sf_count_t r = 0;
     // internally reference if used for override or replace purpose
     bool noChan = (0 == m_chan);
+
     // wait until at least one consumer is attached
     while (!r) {
 	lock();
@@ -432,43 +456,57 @@ void SndSource::run()
 	    return;
 	}
     }
-    unsigned int blen = (m_brate*20)/1000;
     DDebug(&__plugin,DebugAll,"Consumer found, starting to play data with rate %d [%p]",m_brate,this);
+
+    unsigned int blen = (m_brate*20)/1000;
     m_data.assign(0,blen);
     uint64_t tpos = 0;
+    uint64_t last_repeate = 0;
     m_time = tpos;
-    while ((r > 0) && looping(noChan)) {
-	if (m_nodata)
+    unsigned long flags = 0;
+
+again:
+    while (looping(noChan)) {
+
+	if (m_nodata) {
+	    flags |= DataNode::DataSilent;
 	    r = m_data.length();
-	else
+	} else {
 	    if (m_sndfile_raw)
 		r = sf_read_raw(m_sndfile, m_data.data(), m_data.length());
 	    else
 		r = sf_read_short(m_sndfile, (short *)m_data.data(), m_data.length()/2)*2;
-	if (r < 0) {
-	    if (m_stream->canRetry()) {
-		if (looping(noChan)) {
-		    r = 1;
-		    continue;
-		}
-		r = 0;
-	    }
-	    break;
 	}
-	// start counting time after the first successful read
-	if (!tpos)
+
+	// start counting time _after_ the first successful read
+	if (!tpos) {
+	    flags |= DataNode::DataStart;
 	    m_time = tpos = Time::now();
+	}
+
+	// Check for EOF. This is the only case that libsndfile returns 0.
 	if (!r) {
 	    if (m_repeatPos >= 0) {
-		DDebug(&__plugin,DebugAll,"Autorepeating from offset " FMT64 " [%p]",
-		    m_repeatPos,this);
-		sf_seek(m_sndfile, m_repeatPos, SEEK_SET);
+		if (m_total == last_repeate) {
+		    Debug(&__plugin,DebugWarn,"Asked to autorepeate over no data! Exiting.");
+		    break;
+		}
+
+		if (sf_seek(m_sndfile, m_repeatPos, SEEK_SET) < 0) {
+		    Debug(&__plugin,DebugWarn,"Asked to autorepeate, but cannot seek in file! Exiting.");
+		    break;
+		}
+
+		DDebug(&__plugin,DebugAll,"Autorepeating from offset " FMT64 " [%p]", m_repeatPos, this);
+
+		last_repeate = m_total;
 		m_data.assign(0,blen);
-		r = 1;
+		flags |= DataNode::DataMark;
 		continue;
 	    }
 	    break;
 	}
+
 	if (r < (int)m_data.length()) {
 	    // if desired and possible extend last byte to fill buffer
 	    if (s_dataPadding && ((m_format == "mulaw") || (m_format == "alaw"))) {
@@ -480,24 +518,53 @@ void SndSource::run()
 	    else
 		m_data.assign(m_data.data(),r);
 	}
+
 	int64_t dly = tpos - Time::now();
 	if (dly > 0) {
 	    XDebug(&__plugin,DebugAll,"SndSource sleeping for " FMT64 " usec",dly);
 	    Thread::usleep((unsigned long)dly);
 	}
-	if (!looping(noChan))
-	    break;
-	Forward(m_data,ts);
+
+	// Send data to consumers.
+	Forward(m_data,ts,flags);
+
+	// Account for sent data.
 	ts += m_data.length()*m_info.samplerate/m_brate;
 	m_total += r;
 	tpos += (r*(uint64_t)1000000/m_brate);
+	flags = 0;
     }
+
     if (r)
 	notify(0,"replaced");
     else {
+	if (m_assets) {
+	    String* next_file;
+	    m_assets->remove();
+
+	    next_file = static_cast<String *>(m_assets->get());
+
+	    if (next_file) {
+		SF_INFO new_info;
+
+		sf_close(m_sndfile);
+		m_sndfile = sf_open(next_file->c_str(), SFM_READ, &new_info);
+
+		if (new_info.samplerate == m_info.samplerate &&
+		    new_info.channels == m_info.channels &&
+		    new_info.format == m_info.format) {
+		    memcpy(&m_info, &new_info, sizeof(SF_INFO));
+		    Debug(&__plugin,DebugAll,"SndSource '%s' playing next file \"%s\"", m_id.c_str(),next_file->c_str());
+		    goto again;
+		}
+	    }
+	}
+
 	Debug(&__plugin,DebugAll,"SndSource '%s' end of data (%u played) chan=%p [%p]",
 	    m_id.c_str(),m_total,m_chan,this);
-	notify(this,"eof");
+	m_data.clear();
+	Forward(m_data, ts, (unsigned long)DataNode::DataEnd);
+	notify(this, "eof");
     }
 }
 
@@ -732,7 +799,7 @@ bool SndConsumer::setFormat(const DataFormat& format)
 	    m_format = format;
 	else
 	    m_format = sf_info_to_format(m_info);
-	Debug(&__plugin,DebugInfo,"Format changed from %s to %s",tmp.c_str(), m_format.c_str());
+	Debug(&__plugin,DebugInfo,"Consumer format changed from %s to %s",tmp.c_str(), m_format.c_str());
 	return m_format == format;
     }
 
@@ -841,7 +908,7 @@ bool SndConsumer::parseFormat(const char *str, SF_INFO &info)
 
     info.format |= lookup(encoding, sf_subtypes, 0);
 
-    XDebug(&__plugin,DebugAll,"%s %s %s --> %d %x %d \n",
+    DDebug(&__plugin,DebugAll,"%s %s %s --> %d %x %d \n",
 	fmt.matchString(1).c_str(),fmt.matchString(2).c_str(),fmt.matchString(3).c_str(),
 	info.channels, info.format, info.samplerate);
 
