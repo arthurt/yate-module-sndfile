@@ -20,9 +20,7 @@
  */
 
 #include <yatephone.h>
-
 #include <sndfile.h>
-
 #include <string.h>
 
 
@@ -84,7 +82,6 @@ public:
     ~SndSource();
     virtual void run();
     virtual void cleanup();
-    virtual bool setFormat(const DataFormat &format);
     virtual void attached(bool added);
     virtual bool control(NamedList& param);
     void setNotify(const String& id);
@@ -132,19 +129,17 @@ public:
 private:
     CallEndpoint* m_chan;
     Stream* m_stream;
-
-    bool m_sf_format_set;
-    bool m_sf_raw;
-    bool m_valid;
-
     unsigned m_total;
     unsigned m_maxlen;
     uint64_t m_time;
     String m_id;
-
+    String m_reason;
     String m_filename;
     SNDFILE* m_sndfile;
     SF_INFO m_info;
+    bool m_sf_format_set : 1;
+    bool m_sf_raw : 1;
+    bool m_valid : 1;
 };
 
 class SndChan : public Channel
@@ -441,42 +436,35 @@ void SndSource::init(const String& file, bool autorepeat)
 	return;
     }
 
-    String native_format;
-    const FormatInfo *fi = NULL;
-    const char *yate_format_name = lookup(m_info.format & SF_FORMAT_SUBMASK, sf_subtypes);
-
     /*
-     * Initially set our offered format as the raw on-disk form if possible. If
-     * the consumers cannot accept it untranslated, ::setFormat() will be called
-     * and we will switch back to reading as slin only. This allows use to avoid
-     * unnecisarry conversions like mulaw -> slin -> mulaw, but doesn't break
-     * things like mulaw/16000 -> slin/16000 -> slin -> mulaw.
+     * Note that we don't offer slin as a raw-i/o format, because of
+     * endianess. Also, any stateful formats.
      */
-    if (yate_format_name) {
-        if (m_info.channels != 1)
-	    native_format << m_info.channels << "*";
-	native_format << yate_format_name;
-	if (m_info.samplerate != 8000)
-	    native_format << "/" << m_info.samplerate;
-	fi = FormatRepository::getFormat(native_format);
+    String tmp_format;
+    if (m_info.channels != 1)
+	tmp_format << m_info.channels << "*";
+    switch (m_info.format & SF_FORMAT_SUBMASK) {
+	case SF_FORMAT_ULAW: tmp_format << "mulaw"; m_sndfile_raw = true; break;
+	case SF_FORMAT_ALAW: tmp_format << "alaw"; m_sndfile_raw = true; break;
+	default: tmp_format << "slin"; m_sndfile_raw = false; break;
     }
+    if (m_info.samplerate != 8000)
+	tmp_format << "/" << m_info.samplerate;
 
-    /* Only offer on-disk formats for fixed bit rate formats. */
-    if (fi && fi->dataRate() != 0) {
-	m_format = native_format;
-	m_sndfile_raw = true;
-	m_brate = fi->dataRate();
-    } else {
-	m_format = "";
-	if (m_info.channels != 1)
-	    m_format << m_info.channels << "*";
-	m_format << "slin";
-	if (m_info.samplerate != 8000)
-	    m_format << "/" << m_info.samplerate;
-	m_sndfile_raw = false;
+    if (m_sndfile_raw) {
+	const FormatInfo *fi;
+	fi = FormatRepository::getFormat(tmp_format);
+	if (fi && fi->dataRate() != 0) {
+	    m_brate = fi->dataRate();
+	} else {
+	    m_sndfile_raw = false;
+	    tmp_format = sf_info_to_format(m_info);
+	}
+    }
+    if (!m_sndfile_raw) {
 	m_brate = 2 * m_info.channels * m_info.samplerate;
     }
-
+    m_format = tmp_format;
     Debug(&__plugin,DebugInfo,"Playing '%s' as %s", file.c_str(), m_format.c_str());
 
     XDebug(&__plugin,DebugAll, "\n"
@@ -499,32 +487,6 @@ void SndSource::init(const String& file, bool autorepeat)
     start("Snd Source");
 }
 
-bool SndSource::setFormat(const DataFormat &format)
-{
-    DDebug(&__plugin,DebugAll,"SndSource::setFormat \"%s\"",format.c_str());
-
-    return false;
-
-    /*
-     * If we are here, the on-disk format cannot be used. As the only options
-     * are the on-disk formats, or slin of the same channel/samplerate, and
-     * translation only really works on slin, switch back to slin.
-    if (m_sndfile_raw) {
-	m_sndfile_raw = false;
-	m_format = "";
-	if (m_info.channels != 1)
-	    m_format << m_info.channels << "*";
-	m_format << "slin";
-	if (m_info.samplerate != 8000)
-	    m_format << "/" << m_info.samplerate;
-	m_brate = 2 * m_info.channels * m_info.samplerate;
-
-	return m_format == format;
-    }
-     */
-
-    return false;
-}
 
 SndSource::SndSource(CallEndpoint* chan, unsigned maxlen, bool autoclose)
     : m_chan(chan), m_stream(0), m_assets(0), m_brate(0), m_repeatPos(-1),
@@ -537,6 +499,7 @@ SndSource::SndSource(CallEndpoint* chan, unsigned maxlen, bool autoclose)
     s_reading++;
     s_mutex.unlock();
 }
+
 
 SndSource::~SndSource()
 {
@@ -598,8 +561,9 @@ void SndSource::run()
     while (looping(noChan)) {
 
 	if (m_maxlen && m_total >= m_maxlen) {
-	    /* simulate EOF */
-	    goto do_eof;
+	    Forward(m_buffer, ts, (unsigned long)DataNode::DataEnd);
+	    notify(this, "maxlen");
+	    return;
 	}
 
 	if (m_nodata) {
@@ -707,7 +671,6 @@ void SndSource::run()
     if (r) {
 	notify(0, "replaced");
     } else {
-do_eof:
 	Debug(&__plugin,DebugAll,"SndSource '%s' end of data (%u played) chan=%p [%p]",
 	    m_id.c_str(),m_total,m_chan,this);
 	Forward(m_buffer, ts, (unsigned long)DataNode::DataEnd);
@@ -787,14 +750,14 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
     const char* format, bool append, const NamedString* param)
     : m_chan(chan),
       m_stream(0),
-      m_sf_format_set(false),
-      m_sf_raw(false),
-      m_valid(true),
       m_total(0),
       m_maxlen(maxlen),
       m_time(0),
       m_filename(file),
-      m_sndfile(0)
+      m_sndfile(0),
+      m_sf_format_set(false),
+      m_sf_raw(false),
+      m_valid(true)
 {
     Debug(&__plugin,DebugAll,"SndConsumer::SndConsumer(\"%s\",%p,%u,\"%s\",%s,%p) [%p]",
 	file.c_str(),chan,maxlen,format,String::boolText(append),param,this);
@@ -805,7 +768,7 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
 
     memset(&m_info, 0, sizeof(m_info));
 
-/*  TODO
+/*  TODO: Don't know how to test this. So don't know if it works.
     NamedPointer* ptr = YOBJECT(NamedPointer,param);
     if (ptr) {
 	m_stream = YOBJECT(Stream,ptr);
@@ -815,14 +778,16 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
 	}
     }
 */
+
     /* Try and get the filetype & encoding from the file to append. */
     if (append && File::exists(file.c_str()) && !format) {
 	m_sndfile = sf_open(file.c_str(), SFM_RDWR, &m_info);
 
 	if (m_sndfile) {
-	    if (sf_seek(m_sndfile, 0, SEEK_END != 0)) {
+	    if (sf_seek(m_sndfile, 0, SEEK_END) < 0) {
 		Debug(DebugWarn,"Cannot seek in %s: %s\n", file.c_str(),sf_strerror(m_sndfile));
 		m_valid = false;
+		m_reason = "error";
 		return;
 	    }
 	    m_sf_format_set = true;
@@ -834,7 +799,7 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
 
 	/* Guess the filetype (container) from the filename. */
 	if (!(m_info.format & SF_FORMAT_TYPEMASK)) {
-	    int type = sf_guess_major(extension.c_str());
+	    int type = extension.null() ? 0 : sf_guess_major(extension.c_str());
 	    if (type)
 		m_info.format |= type;
 	    else
@@ -863,9 +828,10 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
 
 	if (append && File::exists(file.c_str())) {
 	    m_sndfile = sf_open(file.c_str(), SFM_RDWR, &m_info);
-	    if (!m_sndfile || sf_seek(m_sndfile, 0, SEEK_END != 0)) {
+	    if (!m_sndfile || sf_seek(m_sndfile, 0, SEEK_END) < 0) {
 		Debug(DebugWarn,"Cannot append to %s: %s",file.c_str(),sf_strerror(m_sndfile));
 		m_valid = false;
+		m_reason = "error";
 		return;
 	    } else {
 		m_sf_format_set = true;
@@ -894,6 +860,15 @@ SndConsumer::~SndConsumer()
 	delete m_stream;
     m_stream = 0;
 
+    if (m_id) {
+	DDebug(&__plugin,DebugAll,"SndConsumer enqueueing notify message [%p]",this);
+	Message* m = new Message("chan.notify");
+	m->addParam("targetid",m_id);
+	m->addParam("reason", m_reason.null() ? "replaced" : m_reason.c_str());
+	if (!m_valid)
+	    m->addParam("error",sf_strerror(m_sndfile));
+	Engine::enqueue(m);
+    }
 
     s_mutex.lock();
     s_writing--;
@@ -996,7 +971,7 @@ unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, 
 	    m_sf_format_set = true;
 	}
 
-	Debug(&__plugin,DebugInfo,"Opened %s file \"%s\" for writing %s (%dHz %s)",
+	Debug(&__plugin,DebugInfo,"Opening %s file \"%s\" for writing %s (%dHz %s)",
 	    sf_format_id_name(m_info.format & SF_FORMAT_TYPEMASK),
 	    m_filename.c_str(),
 	    sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK),
@@ -1004,7 +979,8 @@ unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, 
 	m_sndfile = sf_open(m_filename.c_str(), SFM_WRITE, &m_info);
 	if (!m_sndfile) {
 	    Debug(&__plugin,DebugWarn,"Could not open \"%s\" for writing: %s",m_filename.c_str(),sf_strerror(m_sndfile));
-	    m_valid = 0;
+	    m_valid = false;
+	    m_reason = "error";
 	    return 0;
 	}
     }
@@ -1021,6 +997,7 @@ unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, 
 	    m_maxlen = 0;
 	    delete m_stream;
 	    m_stream = 0;
+	    m_reason = "maxlen";
 	    RefPointer<CallEndpoint> chan;
 	    if (m_chan) {
 		DataEndpoint::commonMutex().lock();
