@@ -28,6 +28,30 @@
 using namespace TelEngine;
 namespace { // anonymous
 
+static TokenDict sf_subtypes[] = {
+    { "slin", SF_FORMAT_PCM_16 },
+    { "mulaw", SF_FORMAT_ULAW },
+    { "alaw", SF_FORMAT_ALAW },
+    { "ima", SF_FORMAT_IMA_ADPCM },
+    { "msadpcm", SF_FORMAT_MS_ADPCM },
+    { "gsm", SF_FORMAT_GSM610 },
+    { "g721", SF_FORMAT_G721_32 },
+    { "g726", SF_FORMAT_G721_32 },
+    { "g726_24", SF_FORMAT_G723_24 },
+    { "g726_32", SF_FORMAT_G721_32 },
+    { "g726_40", SF_FORMAT_G723_40 },
+    { "g723_24", SF_FORMAT_G723_24 },
+    { "g723_32", SF_FORMAT_G721_32 },
+    { "g723_40", SF_FORMAT_G723_40 },
+    { "vorbis", SF_FORMAT_VORBIS },
+    { "u8", SF_FORMAT_PCM_U8 },
+    { "s8", SF_FORMAT_PCM_S8 },
+    { "s16", SF_FORMAT_PCM_16 },
+    { "s16le", SF_FORMAT_PCM_16 | SF_ENDIAN_LITTLE },
+    { "s16be", SF_FORMAT_PCM_16 | SF_ENDIAN_BIG },
+    { 0, 0 },
+};
+
 class SndSource : public ThreadedSource
 {
 public:
@@ -66,7 +90,7 @@ public:
     virtual bool setFormat(const DataFormat& format);
     virtual unsigned long Consume(const DataBlock& data, unsigned long tStamp, unsigned long flags);
     virtual void attached(bool added);
-    //virtual bool valid() const;
+    virtual bool valid() const { return m_valid; }
     //virtual bool control(NamedList& param);
     inline void setNotify(const String& id)
 	{ m_id = id; }
@@ -77,6 +101,7 @@ private:
 
     bool m_sf_format_set;
     bool m_sf_raw;
+    bool m_valid;
 
     unsigned m_total;
     unsigned m_maxlen;
@@ -183,6 +208,9 @@ static int sf_guess_major(const char *extension)
 	if (!strcasecmp(extension, format_info.extension))
 	    return format_info.format;
     }
+    /* Annoyingly left out. */
+    if (!strcasecmp(extension, "ogg"))
+	return SF_FORMAT_OGG;
     return 0;
 }
 
@@ -190,7 +218,7 @@ static DataFormat sf_info_to_format(const SF_INFO &m_info)
 {
     String s;
 
-    if (m_info.channels != 0 && m_info.channels != 1)
+    if (m_info.channels > 1)
 	s << m_info.channels << '*';
 
     s << "slin";
@@ -200,6 +228,8 @@ static DataFormat sf_info_to_format(const SF_INFO &m_info)
 
     DataFormat format(s);
 
+    DDebug(&__plugin,DebugAll, "%dHz, %d channels, --  sf_format 0x%08x, Yate Format: %s",
+    m_info.samplerate, m_info.channels, m_info.format, format.c_str());
     return format;
 }
 
@@ -556,6 +586,7 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
       m_stream(0),
       m_sf_format_set(false),
       m_sf_raw(false),
+      m_valid(true),
       m_total(0),
       m_maxlen(maxlen),
       m_time(0),
@@ -588,7 +619,7 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
 	if (m_sndfile) {
 	    if (sf_seek(m_sndfile, 0, SEEK_END != 0)) {
 		Debug(DebugWarn,"Cannot seek in %s: %s\n", file.c_str(),sf_strerror(m_sndfile));
-		// ERROR STATE
+		m_valid = false;
 		return;
 	    }
 	    m_sf_format_set = true;
@@ -608,35 +639,30 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
 	}
 
 	/* User-specified on-disk encoding. */
-	if (format) {
-	    if (parseFormat(format, m_info)) {
+	if (format && parseFormat(format, m_info)) {
+	    if (m_info.format & SF_FORMAT_SUBMASK) {
 		if (sf_format_check(&m_info)) {
-		    m_sf_format_set = true;
+		    if (m_info.channels && m_info.samplerate)
+			m_sf_format_set = true;
 		} else {
-		    Debug(DebugWarn,"Combination of %s in %s is not valid!",
+		    Debug(&__plugin,DebugMild,"Combination of %s in %s is not valid!",
 			sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK),
 			sf_format_id_name(m_info.format & SF_FORMAT_TYPEMASK));
+		    m_info.format &= ~SF_FORMAT_SUBMASK;
 		}
 	    }
 	}
 
-	/* If raw and we still don't have an encoding, use the extension as a hint. */
-	if (m_info.format == SF_FORMAT_RAW) {
-	    if (extension == "alaw") {
-		m_info.format |= SF_FORMAT_ALAW;
-	    } else if (extension == "mulaw" || extension == "ulaw") {
-		m_info.format |= SF_FORMAT_ULAW;
-	    } else if (extension == "gsm") {
-		m_info.format |= SF_FORMAT_GSM610;
-	    } else if (extension == "slin" || extension == "sln")
-		m_info.format |= SF_FORMAT_PCM_16;
-	}
+	/* If raw and we still don't have an encoding, try and use the extension
+	 * as a hint. */
+	if (m_info.format == SF_FORMAT_RAW)
+	    m_info.format |= lookup(extension, sf_subtypes, 0);
 
 	if (append && File::exists(file.c_str())) {
 	    m_sndfile = sf_open(file.c_str(), SFM_RDWR, &m_info);
 	    if (!m_sndfile || sf_seek(m_sndfile, 0, SEEK_END != 0)) {
 		Debug(DebugWarn,"Cannot append to %s: %s",file.c_str(),sf_strerror(m_sndfile));
-		// TODO ERROR STATE:
+		m_valid = false;
 		return;
 	    } else {
 		m_sf_format_set = true;
@@ -647,8 +673,6 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
     if (m_sf_format_set) {
 	m_format = sf_info_to_format(m_info);
     }
-
-    /* If sf_format_set is false still, it will be set by the first call to setFormat */
 }
 
 SndConsumer::~SndConsumer()
@@ -683,51 +707,49 @@ SndConsumer::~SndConsumer()
 bool SndConsumer::setFormat(const DataFormat& format)
 {
     SF_INFO ep_info = { 0 };
-    bool ok = false;
 
     Debug(&__plugin,DebugAll,"SndConsumer::setFormat \"%s\"",format.c_str());
-
-    /* If writing raw, cannot change the format now. */
-    if (m_sf_raw)
-	return false;
 
     if (!parseFormat(format.c_str(), ep_info))
 	return false;
 
-    /* If we haven't yet set an on-disk encoding, try this one. */
+    /* If we haven't yet set an on-disk encoding/rate/channel, try to match
+     * this as closely as possible. */
     if (!m_sf_format_set) {
 	int subfmt = m_info.format & SF_FORMAT_SUBMASK;
-	if ((!m_info.channels || m_info.channels == ep_info.channels) &&
-	    (!m_info.samplerate || m_info.samplerate == ep_info.samplerate) &&
-	    (!subfmt || subfmt == ep_info.format))
-	{
+
+	if (!m_info.channels && ep_info.channels)
 	    m_info.channels = ep_info.channels;
+
+	if (!m_info.samplerate && ep_info.samplerate)
 	    m_info.samplerate = ep_info.samplerate;
+
+	if (!subfmt && ep_info.format) {
 	    m_info.format |= ep_info.format;
-
-	    ok = true;
-	    m_sf_format_set = true;
+	    if (!sf_format_check(&m_info)) {
+		m_info.format &= ~SF_FORMAT_SUBMASK;
+	    }
 	}
     }
 
-    /* Check to see if the format is *exactly* what we are writing, and if so
-     * switch to writing it raw to avoid a->b->a conversions. Avoid raw PCM,
-     * as in most cases it is pass-through, except for endian-ness issues.
+    /* Check to see if the format the endpoint is offering is *exactly*
+     * identical to the on-disk format. If so, we can do raw writes and avoid
+     * an a->b->a series of conversions.
+     *
+     * Exception: Endianness of PCM. As writing it through shorts is basically
+     * raw when endianness is the same, just ignore it.
      */
-    if (ep_info.format != SF_FORMAT_PCM_16 &&
-	ep_info.format == (m_info.format & SF_FORMAT_SUBMASK) &&
-	ep_info.channels == m_info.channels &&
-	ep_info.samplerate == m_info.samplerate)
-    {
-	m_sf_raw = true;
-	if (m_format != format) {
-	    m_format = format;
-	    return true;
-	}
-    }
+    m_sf_raw = (ep_info.format != SF_FORMAT_PCM_16 &&
+		ep_info.channels && ep_info.samplerate &&
+		ep_info.format == (m_info.format & SF_FORMAT_SUBMASK) &&
+		ep_info.channels == m_info.channels &&
+		ep_info.samplerate == m_info.samplerate);
 
-    if (ok && m_format != format) {
-	m_format = sf_info_to_format(m_info);
+    if (m_format != format) {
+	if (m_sf_raw)
+	    m_format = format;
+	else
+	    m_format = sf_info_to_format(m_info);
 	return m_format == format;
     }
 
@@ -738,15 +760,43 @@ bool SndConsumer::setFormat(const DataFormat& format)
 unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, unsigned long flags)
 {
     if (!m_sndfile) {
-	if (!(m_info.format & SF_FORMAT_SUBMASK))
-	    m_info.format |= SF_FORMAT_PCM_16;
-	Debug(&__plugin,DebugInfo,"Opened %s file \"%s\" for writing %s\n",
+	if (!m_sf_format_set) {
+	    if (!m_info.channels)
+		m_info.channels = m_format.numChannels(1);
+	    if (!m_info.samplerate)
+		m_info.samplerate = m_format.sampleRate(8000);
+
+	    /* Hunt for a subtype that fits in this encoding. */
+	    if (!(m_info.format & SF_FORMAT_SUBMASK)) {
+		SF_FORMAT_INFO info;
+		int k, count;
+
+		sf_command(NULL, SFC_GET_FORMAT_SUBTYPE_COUNT, &count, sizeof(count));
+		for (k = 0; k < count; k++) {
+		    info.format = k;
+		    sf_command(NULL, SFC_GET_FORMAT_SUBTYPE, &info, sizeof(info));
+
+		    /* Hack: skip 8-bit audio... */
+		    if (m_info.format == SF_FORMAT_PCM_S8)
+			continue;
+
+		    m_info.format = (m_info.format & SF_FORMAT_TYPEMASK) | info.format;
+		    if (sf_format_check(&m_info))
+			break;
+		}
+	    }
+	    m_sf_format_set = true;
+	}
+
+	Debug(&__plugin,DebugInfo,"Opened %s file \"%s\" for writing %s (%dHz %s)",
 	    sf_format_id_name(m_info.format & SF_FORMAT_TYPEMASK),
 	    m_filename.c_str(),
-	    sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK));
+	    sf_format_id_name(m_info.format & SF_FORMAT_SUBMASK),
+	    m_info.samplerate, m_info.channels == 1 ? "mono" : m_info.channels == 2 ? "stereo" : "multi-channel");
 	m_sndfile = sf_open(m_filename.c_str(), SFM_WRITE, &m_info);
 	if (!m_sndfile) {
 	    Debug(&__plugin,DebugWarn,"Could not open \"%s\" for writing: %s",m_filename.c_str(),sf_strerror(m_sndfile));
+	    m_valid = 0;
 	    return 0;
 	}
     }
@@ -793,42 +843,27 @@ void SndConsumer::attached(bool added)
 bool SndConsumer::parseFormat(const char *str, SF_INFO &info)
 {
     String fmt(str);
-    String rate;
 
     if (!fmt.matches(s_formatParser)) {
 	Debug(&__plugin,DebugWarn,"Cannot parse \"%s\"", str);
 	return false;
     }
 
+    info.samplerate = 8000;
+    info.channels = 1;
+
+    fmt.matchString(1) >> info.channels;
     String encoding(fmt.matchString(2));
-    if (encoding == "slin")
-	info.format |= SF_FORMAT_PCM_16;
-    else if (encoding == "mulaw")
-	info.format |= SF_FORMAT_ULAW;
-    else if (encoding == "alaw")
-	info.format |= SF_FORMAT_ALAW;
-    else if (encoding == "gsm")
-	info.format |= SF_FORMAT_GSM610;
-    else if (encoding == "g726" || encoding == "g721" || encoding == "g726_32")
-	info.format |= SF_FORMAT_G721_32;
-    else if (encoding == "vorbis")
-	info.format |= SF_FORMAT_VORBIS;
-    else {
-	info.format |= SF_FORMAT_PCM_16;
-	Debug(&__plugin,DebugMild,"Format encoding \"%s\" not understood.",encoding.c_str());
-    }
+    fmt.matchString(3) >> "/" >> info.samplerate;
 
-    rate = fmt.matchString(3) >> "/";
-    info.channels = fmt.matchString(1).toInteger(1);
-    info.samplerate = rate.toInteger(8000);
+    info.format |= lookup(encoding, sf_subtypes, 0);
 
-    Debug(&__plugin,DebugInfo,"%s %s %s --> %d %x %d \n",
-	fmt.matchString(1).c_str(),fmt.matchString(2).c_str(),rate.c_str(),
+    DDebug(&__plugin,DebugInfo,"%s %s %s --> %d %x %d \n",
+	fmt.matchString(1).c_str(),fmt.matchString(2).c_str(),fmt.matchString(3).c_str(),
 	info.channels, info.format, info.samplerate);
 
-    return true;
+    return (info.format & SF_FORMAT_SUBMASK) != 0;
 }
-
 
 Disconnector::Disconnector(CallEndpoint* chan, const String& id, SndSource* source, SndConsumer* consumer, bool disc, const char* reason)
     : Thread("SndDisconnector"),
