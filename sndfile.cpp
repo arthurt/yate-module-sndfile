@@ -79,7 +79,7 @@ static TokenDict sf_subtypes[] = {
 class SndSource : public ThreadedSource
 {
 public:
-    static SndSource* create(const String& file, CallEndpoint* chan,
+    static SndSource* create(const String& file, CallEndpoint* chan, unsigned maxlen,
 	bool autoclose, bool autorepeat, const NamedString* param);
     ~SndSource();
     virtual void run();
@@ -88,7 +88,7 @@ public:
     virtual bool control(NamedList& param);
     void setNotify(const String& id);
 private:
-    SndSource(CallEndpoint* chan, bool autoclose);
+    SndSource(CallEndpoint* chan, unsigned maxlen, bool autoclose);
     void init(const String& file, bool autorepeat);
     void notify(SndSource* source, const char* reason = 0);
 
@@ -101,6 +101,7 @@ private:
     unsigned m_brate;
     int64_t m_repeatPos;
     unsigned m_total;
+    unsigned m_maxlen;
     uint64_t m_time;
 
     String m_id;
@@ -322,9 +323,9 @@ static SF_VIRTUAL_IO yate_vio = {
     yate_vio_tell
 };
 
-SndSource* SndSource::create(const String& file, CallEndpoint* chan, bool autoclose, bool autorepeat, const NamedString* param)
+SndSource* SndSource::create(const String& file, CallEndpoint* chan, unsigned maxlen, bool autoclose, bool autorepeat, const NamedString* param)
 {
-    SndSource* tmp = new SndSource(chan,autoclose);
+    SndSource* tmp = new SndSource(chan,maxlen,autoclose);
     NamedPointer* ptr = YOBJECT(NamedPointer,param);
     if (ptr) {
 	Stream* stream = YOBJECT(Stream,ptr);
@@ -465,10 +466,10 @@ void SndSource::init(const String& file, bool autorepeat)
     start("Snd Source");
 }
 
-SndSource::SndSource(CallEndpoint* chan, bool autoclose)
+SndSource::SndSource(CallEndpoint* chan, unsigned maxlen, bool autoclose)
     : m_chan(chan), m_stream(0), m_assets(0), m_brate(0), m_repeatPos(-1),
-      m_total(0), m_time(0), m_autoclose(autoclose), m_nodata(false),
-      m_sndfile(0), m_sndfile_raw(false)
+      m_total(0), m_maxlen(maxlen), m_time(0), m_autoclose(autoclose),
+      m_nodata(false), m_sndfile(0), m_sndfile_raw(false)
 {
     Debug(&__plugin,DebugAll,"SndSource::SndSource(%p) [%p]",chan,this);
     memset(&m_info, 0, sizeof(SF_INFO));
@@ -535,6 +536,9 @@ void SndSource::run()
     unsigned long flags = 0;
 
     while (looping(noChan)) {
+
+	if (m_maxlen && m_total >= m_maxlen)
+	    break;
 
 	if (m_nodata) {
 	    flags |= DataNode::DataSilent;
@@ -833,7 +837,8 @@ SndConsumer::~SndConsumer()
     s_mutex.unlock();
 }
 
-/* This is the format the other endpoint wants to send us, not necessarily what
+/*
+ * This is the format the other endpoint wants to send us, not necessarily what
  * encoding the file is. If sf_format_set is still false, try and use this
  * format for the on-disk encoding.
  *
@@ -848,8 +853,10 @@ bool SndConsumer::setFormat(const DataFormat& format)
 
     parseFormat(format.c_str(), ep_info);
 
-    /* If we haven't yet set an on-disk encoding/rate/channel, try to match
-     * this as closely as possible. */
+    /*
+     * If we haven't yet set an on-disk encoding/rate/channel, try to match
+     * this as closely as possible.
+     */
     if (!m_sf_format_set) {
 	int subfmt = m_info.format & SF_FORMAT_SUBMASK;
 
@@ -867,7 +874,8 @@ bool SndConsumer::setFormat(const DataFormat& format)
 	}
     }
 
-    /* Check to see if the format the endpoint is offering is *exactly*
+    /*
+     * Check to see if the format the endpoint is offering is *exactly*
      * identical to the on-disk format. If so, we can do raw writes and avoid
      * an a->b->a series of conversions.
      *
@@ -1068,7 +1076,7 @@ SndChan::SndChan(const String& file, bool record, unsigned maxlen, const NamedLi
 	getConsumer()->deref();
     }
     else {
-	setSource(SndSource::create(file,this,true,msg.getBoolValue("autorepeat"),param));
+	setSource(SndSource::create(file,this,maxlen,true,msg.getBoolValue("autorepeat"),param));
 	getSource()->deref();
     }
 }
@@ -1208,7 +1216,7 @@ bool AttachHandler::received(Message &msg)
 	    /* clear source */
 	    ch->setSource();
 	} else {
-	    SndSource* s = SndSource::create(src,ch,false,msg.getBoolValue("autorepeat"),msg.getParam("source"));
+	    SndSource* s = SndSource::create(src,ch,maxlen,false,msg.getBoolValue("autorepeat"),msg.getParam("source"));
 	    ch->setSource(s);
 	    s->setNotify(msg.getValue("notify_source",notify));
 	    s->deref();
@@ -1238,7 +1246,7 @@ bool AttachHandler::received(Message &msg)
 	    ret = false;
 	    break;
 	}
-	SndSource* s = SndSource::create(ovr,0,false,msg.getBoolValue("autorepeat"),msg.getParam("override"));
+	SndSource* s = SndSource::create(ovr,0,maxlen,false,msg.getBoolValue("autorepeat"),msg.getParam("override"));
 	s->setNotify(msg.getValue("notify_override",notify));
 	if (DataTranslator::attachChain(s,c,true))
 	    msg.clearParam("override");
@@ -1260,7 +1268,7 @@ bool AttachHandler::received(Message &msg)
 	    ret = false;
 	    break;
 	}
-	SndSource* s = SndSource::create(repl,0,false,msg.getBoolValue("autorepeat"),msg.getParam("replace"));
+	SndSource* s = SndSource::create(repl,0,maxlen,false,msg.getBoolValue("autorepeat"),msg.getParam("replace"));
 	s->setNotify(msg.getValue("notify_replace",notify));
 	if (DataTranslator::attachChain(s,c,false))
 	    msg.clearParam("replace");
