@@ -85,7 +85,7 @@ public:
     virtual void run();
     virtual void cleanup();
     virtual void attached(bool added);
-    //virtual void control(NamedList& param);
+    virtual bool control(NamedList& param);
     void setNotify(const String& id);
 private:
     SndSource(CallEndpoint* chan, bool autoclose);
@@ -95,7 +95,8 @@ private:
     CallEndpoint* m_chan;
     Stream* m_stream;
     ObjList* m_assets;
-    DataBlock m_data;
+    DataBlock m_buffer;
+    ObjList* m_commands;
 
     unsigned m_brate;
     int64_t m_repeatPos;
@@ -516,17 +517,18 @@ void SndSource::run()
 	lock();
 	r = m_consumers.count();
 	unlock();
-	if (!r)
-	    Thread::idle();
+	if (r)
+	    break;
 	if (!looping(noChan)) {
 	    notify(0,"replaced");
 	    return;
 	}
+	Thread::idle();
     }
     DDebug(&__plugin,DebugAll,"Consumer found, starting to play data with rate %d [%p]",m_brate,this);
 
     unsigned int blen = (m_brate*20)/1000;
-    m_data.assign(0,blen);
+    m_buffer.assign(0,blen);
     uint64_t tpos = 0;
     uint64_t last_repeate = 0;
     m_time = tpos;
@@ -536,12 +538,12 @@ void SndSource::run()
 
 	if (m_nodata) {
 	    flags |= DataNode::DataSilent;
-	    r = m_data.length();
+	    r = m_buffer.length();
 	} else {
 	    if (m_sndfile_raw)
-		r = sf_read_raw(m_sndfile, m_data.data(), m_data.length());
+		r = sf_read_raw(m_sndfile, m_buffer.data(), m_buffer.length());
 	    else
-		r = sf_read_short(m_sndfile, (short *)m_data.data(), m_data.length()/2)*2;
+		r = sf_read_short(m_sndfile, (short *)m_buffer.data(), m_buffer.length()/2)*2;
 	}
 
 	// start counting time _after_ the first successful read
@@ -566,7 +568,7 @@ void SndSource::run()
 		DDebug(&__plugin,DebugAll,"Autorepeating from offset " FMT64 " [%p]", m_repeatPos, this);
 
 		last_repeate = m_total;
-		m_data.assign(0,blen);
+		m_buffer.assign(0,blen);
 		flags |= DataNode::DataMark;
 		continue;
 	    }
@@ -607,16 +609,16 @@ void SndSource::run()
 	    }
 	}
 
-	if (r < (int)m_data.length()) {
+	if (r < (int)m_buffer.length()) {
 	    // if desired and possible extend last byte to fill buffer
 	    if (s_dataPadding && ((m_format == "mulaw") || (m_format == "alaw"))) {
-		unsigned char* d = (unsigned char*)m_data.data();
+		unsigned char* d = (unsigned char*)m_buffer.data();
 		unsigned char last = d[r-1];
-		while (r < (int)m_data.length())
+		while (r < (int)m_buffer.length())
 		    d[r++] = last;
 	    }
 	    else
-		m_data.assign(m_data.data(),r);
+		m_buffer.assign(m_buffer.data(),r);
 	}
 
 	int64_t dly = tpos - Time::now();
@@ -626,23 +628,24 @@ void SndSource::run()
 	}
 
 	// Send data to consumers.
-	Forward(m_data,ts,flags);
+	Forward(m_buffer,ts,flags);
 
 	// Account for sent data.
-	ts += m_data.length()*m_info.samplerate/m_brate;
+	ts += m_buffer.length()*m_info.samplerate/m_brate;
 	m_total += r;
 	tpos += (r*(uint64_t)1000000/m_brate);
 	flags = 0;
     }
 
-    if (r)
-	notify(0,"replaced");
-
-    Debug(&__plugin,DebugAll,"SndSource '%s' end of data (%u played) chan=%p [%p]",
-	m_id.c_str(),m_total,m_chan,this);
-    m_data.clear();
-    Forward(m_data, ts, (unsigned long)DataNode::DataEnd);
-    notify(this, "eof");
+    m_buffer.clear();
+    if (r) {
+	notify(0, "replaced");
+    } else {
+	Debug(&__plugin,DebugAll,"SndSource '%s' end of data (%u played) chan=%p [%p]",
+	    m_id.c_str(),m_total,m_chan,this);
+	Forward(m_buffer, ts, (unsigned long)DataNode::DataEnd);
+	notify(this, "eof");
+    }
 }
 
 void SndSource::cleanup()
@@ -667,6 +670,13 @@ void SndSource::attached(bool added)
 	DDebug(&__plugin,DebugInfo,"SndSource clearing dead chan %p [%p]",m_chan,this);
 	m_chan = 0;
     }
+}
+
+bool SndSource::control(NamedList &param)
+{
+    DDebug(&__plugin,DebugAll,"SndSource::control [%p]",this);
+    /* TODO: Flesh this out. */
+    return false;
 }
 
 void SndSource::setNotify(const String& id)
@@ -1194,20 +1204,29 @@ bool AttachHandler::received(Message &msg)
     unsigned int maxlen = msg.getIntValue("maxlen");
 
     if (!src.null()) {
-	SndSource* s = SndSource::create(src,ch,false,msg.getBoolValue("autorepeat"),msg.getParam("source"));
-	ch->setSource(s);
-	s->setNotify(msg.getValue("notify_source",notify));
-	s->deref();
-	msg.clearParam("source");
+	if (src == "-") {
+	    /* clear source */
+	    ch->setSource();
+	} else {
+	    SndSource* s = SndSource::create(src,ch,false,msg.getBoolValue("autorepeat"),msg.getParam("source"));
+	    ch->setSource(s);
+	    s->setNotify(msg.getValue("notify_source",notify));
+	    s->deref();
+	    msg.clearParam("source");
+	}
     }
 
     if (!cons.null()) {
-	SndConsumer* c = new SndConsumer(cons,ch,maxlen,msg.getValue("format"),
-	    msg.getBoolValue("append"),msg.getParam("consumer"));
-	c->setNotify(msg.getValue("notify_consumer",notify));
-	ch->setConsumer(c);
-	c->deref();
-	msg.clearParam("consumer");
+	if (cons == "-") {
+	    ch->setConsumer();
+	} else {
+	    SndConsumer* c = new SndConsumer(cons,ch,maxlen,msg.getValue("format"),
+		msg.getBoolValue("append"),msg.getParam("consumer"));
+	    c->setNotify(msg.getValue("notify_consumer",notify));
+	    ch->setConsumer(c);
+	    c->deref();
+	    msg.clearParam("consumer");
+	}
     }
 
     while (!ovr.null()) {
