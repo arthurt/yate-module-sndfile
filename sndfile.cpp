@@ -65,6 +65,7 @@ public:
     virtual void attached(bool added);
     virtual bool control(NamedList& param);
     void setNotify(const String& id);
+    unsigned getTotalms() const;
 private:
     SndSource(CallEndpoint* chan, unsigned maxlen, bool autoclose);
     void init(const String& file, bool autorepeat);
@@ -98,6 +99,7 @@ public:
     //virtual bool control(NamedList& param);
     inline void setNotify(const String& id)
 	{ m_id = id; }
+    unsigned getTotalms() const;
 private:
     SNDFILE* m_sndfile;
     SF_INFO m_info;
@@ -125,7 +127,8 @@ public:
 class Disconnector : public Thread
 {
 public:
-    Disconnector(CallEndpoint* chan, const String& id, SndSource* source, SndConsumer* consumer, bool disc, const char* reason = 0);
+    Disconnector(CallEndpoint* chan, const String& id, SndSource* source, bool disc, const char* reason = 0);
+    Disconnector(CallEndpoint* chan, const String& id, SndConsumer* consumer, bool disc, const char* reason = 0);
     virtual ~Disconnector();
     virtual void run();
     bool init();
@@ -147,6 +150,7 @@ public:
     virtual ~SndFileDriver();
     virtual void initialize();
     virtual bool msgExecute(Message& msg, String& dest);
+    virtual bool isBusy();
     bool tryUnload();
 protected:
     void statusParams(String& str);
@@ -155,7 +159,6 @@ private:
     RecordHandler* m_recHandler;
 };
 
-Mutex s_mutex(false,"SndFile");
 int s_reading = 0;
 int s_writing = 0;
 bool s_dataPadding = true;
@@ -443,9 +446,9 @@ SndSource::SndSource(CallEndpoint* chan, unsigned maxlen, bool autoclose)
 {
     Debug(&__plugin,DebugAll,"SndSource::SndSource(%p) [%p]",chan,this);
     memset(&m_info, 0, sizeof(SF_INFO));
-    s_mutex.lock();
+    __plugin.lock();
     s_reading++;
-    s_mutex.unlock();
+    __plugin.unlock();
 }
 
 
@@ -468,9 +471,9 @@ SndSource::~SndSource()
 	delete m_stream;
 	m_stream = 0;
     }
-    s_mutex.lock();
+    __plugin.lock();
     s_reading--;
-    s_mutex.unlock();
+    __plugin.unlock();
 }
 
 void SndSource::run() {
@@ -560,7 +563,7 @@ void SndSource::run() {
 
 	int64_t dly = tpos - Time::now();
 	if (dly > 0) {
-	    XDebug(&__plugin,DebugAll,"SndSource sleeping for " FMT64 " usec",dly);
+	    //XDebug(&__plugin,DebugAll,"SndSource sleeping for " FMT64 " usec",dly);
 	    Thread::usleep((unsigned long)dly);
 	}
 
@@ -640,17 +643,30 @@ void SndSource::notify(SndSource* source, const char* reason)
 	    m->addParam("targetid",m_id);
 	    if (reason)
 		m->addParam("reason",reason);
+	    m->addParam("total_ms", String(getTotalms()));
 	    Engine::enqueue(m);
 	}
     }
     else if (m_id || m_autoclose) {
 	DDebug(&__plugin,DebugInfo,"Preparing '%s' disconnector for '%s' chan %p '%s' source=%p [%p]",
 	    reason,m_id.c_str(),(void*)chan,chan->id().c_str(),source,this);
-	Disconnector *disc = new Disconnector(chan,m_id,source,0,m_autoclose,reason);
+	Disconnector *disc = new Disconnector(chan,m_id,source,m_autoclose,reason);
 	if (!disc->init() && m_autoclose)
 	    chan->clearData(source);
     }
     stop();
+}
+
+unsigned int SndSource::getTotalms() const
+{
+    FormatInfo fi(*getFormat().getInfo());
+    return (m_total * 1000) / fi.dataRate();
+}
+
+unsigned int SndConsumer::getTotalms() const
+{
+    FormatInfo fi(*getFormat().getInfo());
+    return (m_total * 1000) / fi.dataRate();
 }
 
 SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen,
@@ -661,9 +677,9 @@ SndConsumer::SndConsumer(const String& file, CallEndpoint* chan, unsigned maxlen
     Debug(&__plugin,DebugAll,"SndConsumer::SndConsumer(\"%s\",%p,%u,\"%s\",%s,%p) [%p]",
 	file.c_str(),chan,maxlen,format,String::boolText(append),param,this);
 
-    s_mutex.lock();
+    __plugin.lock();
     s_writing++;
-    s_mutex.unlock();
+    __plugin.unlock();
 
     memset(&m_info, 0, sizeof(m_info));
 
@@ -764,14 +780,15 @@ SndConsumer::~SndConsumer()
 	Message* m = new Message("chan.notify");
 	m->addParam("targetid",m_id);
 	m->addParam("reason", m_reason.null() ? "replaced" : m_reason.c_str());
+	m->addParam("total_ms", String(getTotalms()));
 	if (!m_valid)
 	    m->addParam("error",sf_strerror(m_sndfile));
 	Engine::enqueue(m);
     }
 
-    s_mutex.lock();
+    __plugin.lock();
     s_writing--;
-    s_mutex.unlock();
+    __plugin.unlock();
 }
 
 /*
@@ -890,7 +907,7 @@ unsigned long SndConsumer::Consume(const DataBlock& data, unsigned long tStamp, 
 	    if (chan) {
 		DDebug(&__plugin,DebugInfo,"Preparing 'maxlen' disconnector for '%s' chan %p '%s' in consumer [%p]",
 		    m_id.c_str(),(void*)chan,chan->id().c_str(),this);
-		Disconnector *disc = new Disconnector(chan,m_id,0,this,false,"maxlen");
+		Disconnector *disc = new Disconnector(chan,m_id,this,false,"maxlen");
 		disc->init();
 	    }
 	}
@@ -907,7 +924,24 @@ void SndConsumer::attached(bool added)
     }
 }
 
-Disconnector::Disconnector(CallEndpoint* chan, const String& id, SndSource* source, SndConsumer* consumer, bool disc, const char* reason)
+Disconnector::Disconnector(CallEndpoint* chan, const String& id, SndSource* source, bool disc, const char* reason)
+    : Thread("SndDisconnector"),
+      m_chan(chan), m_msg(0), m_source(source), m_consumer(0), m_disc(disc)
+{
+    if (id) {
+	Message* m = new Message("chan.notify");
+	if (m_chan)
+	    m->addParam("id",m_chan->id());
+	m->addParam("targetid",id);
+	if (reason)
+	    m->addParam("reason",reason);
+	m->addParam("total_ms", String(source->getTotalms()));
+	m->userData(m_chan);
+	m_msg = m;
+    }
+}
+
+Disconnector::Disconnector(CallEndpoint* chan, const String& id, SndConsumer* consumer, bool disc, const char* reason)
     : Thread("SndDisconnector"),
       m_chan(chan), m_msg(0), m_source(0), m_consumer(consumer), m_disc(disc)
 {
@@ -918,6 +952,7 @@ Disconnector::Disconnector(CallEndpoint* chan, const String& id, SndSource* sour
 	m->addParam("targetid",id);
 	if (reason)
 	    m->addParam("reason",reason);
+	m->addParam("total_ms", String(consumer->getTotalms()));
 	m->userData(m_chan);
 	m_msg = m;
     }
@@ -943,8 +978,8 @@ bool Disconnector::init()
 
 void Disconnector::run()
 {
-    DDebug(&__plugin,DebugAll,"Disconnector::run() chan=%p msg=%p source=%p disc=%s [%p]",
-	(void*)m_chan,m_msg,m_source,String::boolText(m_disc),this);
+    DDebug(&__plugin,DebugAll,"Disconnector::run() chan=%p msg=%p source=%p consumer=%p disc=%s [%p]",
+	(void*)m_chan,m_msg,m_source,m_consumer,String::boolText(m_disc),this);
     if (!m_chan)
 	return;
     if (m_source) {
@@ -1355,12 +1390,10 @@ void SndFileDriver::statusParams(String& str)
 }
 
 SndFileDriver::SndFileDriver()
-    : Driver("snd","misc"), m_attachHandler(0), m_recHandler(0)
+: Driver("snd","misc"), m_attachHandler(0), m_recHandler(0)
 {
     char buffer[128];
-
     sf_command(NULL, SFC_GET_LIB_VERSION, buffer, sizeof(buffer));
-
     Output("Loaded module SndFile - Based on %s", buffer);
 }
 
@@ -1380,17 +1413,19 @@ void SndFileDriver::initialize()
     }
 }
 
+bool SndFileDriver::isBusy()
+{
+    Lock lock(&__plugin);
+    return (s_reading > 0 || s_writing > 0);
+}
+
 bool SndFileDriver::tryUnload()
 {
-    s_mutex.lock();
-    if (s_reading || s_writing) {
-	s_mutex.unlock();
+    if (isBusy())
 	return false;
-    }
-    s_mutex.unlock();
+    uninstallRelays();
     Engine::uninstall(m_attachHandler);
     Engine::uninstall(m_recHandler);
-    uninstallRelays();
     return true;
 }
 
